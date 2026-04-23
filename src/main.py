@@ -11,7 +11,7 @@ def main():
     
     # 设置应用程序信息
     app.setApplicationName('PDF转换器')
-    app.setApplicationVersion('2.0.0')
+    app.setApplicationVersion('4.0.0')
     
     window = MainWindow()
     window.show()

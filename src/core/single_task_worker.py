@@ -86,3 +86,6 @@ class SingleTaskWorker(QThread):
         self._is_cancelled = True
         if self.word_converter:
             self.word_converter.cancel()
+        if self.markdown_converter:
+            if hasattr(self.markdown_converter, 'cancel'):
+                self.markdown_converter.cancel()

@@ -1,11 +1,14 @@
 import os
 import re
+import logging
 import base64
 from pathlib import Path
 from typing import Optional, List, Dict, Tuple
 import pdfplumber
 from PIL import Image
 import io
+
+logger = logging.getLogger(__name__)
 
 
 class PDFToMarkdownConverter:
@@ -82,7 +85,7 @@ class PDFToMarkdownConverter:
                                 markdown_content.append(img_markdown)
                     except Exception as e:
                         # 图片提取失败不影响主流程
-                        print(f"提取第{page_num}页图片时出错: {e}")
+                        logger.info(f"提取第{page_num}页图片时出错: {e}")
                         continue
                     
                     # 分页符
@@ -133,7 +136,7 @@ class PDFToMarkdownConverter:
             return False
             
         except Exception as e:
-            print(f"保存图片失败: {e}")
+            logger.info(f"保存图片失败: {e}")
             return False
     
     def _convert_text_to_markdown(self, text: str, page_num: int) -> str:

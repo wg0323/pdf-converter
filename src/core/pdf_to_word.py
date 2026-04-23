@@ -1,10 +1,13 @@
 import os
 import gc
+import logging
 import traceback
 import tempfile
 from pathlib import Path
 from typing import Optional, List, Tuple
 from pdf2docx import Converter
+
+logger = logging.getLogger(__name__)
 
 
 class PDFToWordConverter:
@@ -51,13 +54,13 @@ class PDFToWordConverter:
             # 如果所有采样页都无文字且有图片，则判定为扫描版
             is_scanned = (no_text_count == check_count) and (check_count > 0)
             if is_scanned:
-                print(f"检测到扫描版PDF（{check_count}/{check_count}页无文字）")
+                logger.info(f"检测到扫描版PDF（{check_count}/{check_count}页无文字）")
             else:
-                print(f"非扫描版PDF（{no_text_count}/{check_count}页无文字）")
+                logger.info(f"非扫描版PDF（{no_text_count}/{check_count}页无文字）")
             return is_scanned
 
         except Exception as e:
-            print(f"检测PDF类型时出错: {e}")
+            logger.info(f"检测PDF类型时出错: {e}")
             return False
 
     # ========== OCR引擎管理 ==========
@@ -72,20 +75,20 @@ class PDFToWordConverter:
         if self._ocr_engine is None:
             try:
                 from paddleocr import PaddleOCR
-                print("正在初始化OCR引擎...")
+                logger.info("正在初始化OCR引擎...")
                 self._ocr_engine = PaddleOCR(
                     use_angle_cls=True,
                     lang='ch',
                     show_log=False
                 )
-                print("OCR引擎初始化完成")
+                logger.info("OCR引擎初始化完成")
             except ImportError:
-                print("PaddleOCR未安装，扫描版PDF将使用图片模式转换")
-                print("提示：安装 paddleocr 和 paddlepaddle 可启用OCR文字识别功能")
+                logger.info("PaddleOCR未安装，扫描版PDF将使用图片模式转换")
+                logger.info("提示：安装 paddleocr 和 paddlepaddle 可启用OCR文字识别功能")
                 return None
             except Exception as e:
-                print(f"OCR引擎初始化失败: {e}")
-                print("扫描版PDF将使用图片模式转换")
+                logger.info(f"OCR引擎初始化失败: {e}")
+                logger.info("扫描版PDF将使用图片模式转换")
                 return None
         return self._ocr_engine
 
@@ -130,7 +133,7 @@ class PDFToWordConverter:
         actual_end = min(end or total_pages, total_pages)
         pages_to_convert = actual_end - start
 
-        print(f"图片模式转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
+        logger.info(f"图片模式转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
 
         word_doc = Document()
 
@@ -167,7 +170,7 @@ class PDFToWordConverter:
                 except OSError:
                     pass
 
-                print(f"已处理第 {page_idx + 1}/{total_pages} 页")
+                logger.info(f"已处理第 {page_idx + 1}/{total_pages} 页")
 
             doc.close()
 
@@ -187,13 +190,19 @@ class PDFToWordConverter:
                 return False, "转换完成但输出文件不存在"
 
             file_size_kb = os.path.getsize(output_path) / 1024
-            print(f"图片模式转换完成，文件大小: {file_size_kb:.1f}KB")
+            logger.info(f"图片模式转换完成，文件大小: {file_size_kb:.1f}KB")
             return True, f"成功转换到: {output_path}"
 
         except Exception as e:
             doc.close()
+            # 清理临时目录
+            try:
+                import shutil
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            except Exception:
+                pass
             error_msg = f"图片模式转换失败: {str(e)}"
-            print(f"错误详情:\n{traceback.format_exc()}")
+            logger.error(f"错误详情:\n{traceback.format_exc()}")
             return False, error_msg
 
     # ========== 扫描版PDF的OCR转换 ==========
@@ -229,7 +238,7 @@ class PDFToWordConverter:
 
         if ocr is None:
             # OCR不可用，回退到图片模式
-            print("OCR不可用，使用图片模式转换扫描版PDF")
+            logger.info("OCR不可用，使用图片模式转换扫描版PDF")
             return self._convert_scanned_pdf_as_images(
                 pdf_path, output_path, start, end, progress_callback
             )
@@ -245,7 +254,7 @@ class PDFToWordConverter:
         actual_end = min(end or total_pages, total_pages)
         pages_to_convert = actual_end - start
 
-        print(f"扫描版PDF，使用OCR转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
+        logger.info(f"扫描版PDF，使用OCR转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
 
         word_doc = Document()
         ocr = self._get_ocr_engine()
@@ -270,7 +279,7 @@ class PDFToWordConverter:
                 if progress_callback:
                     progress_callback(current_page, pages_to_convert)
 
-                print(f"OCR识别第 {page_idx + 1}/{total_pages} 页...")
+                logger.info(f"OCR识别第 {page_idx + 1}/{total_pages} 页...")
 
                 # 提取页面图片用于OCR
                 pix = page.get_pixmap(dpi=200)
@@ -314,7 +323,7 @@ class PDFToWordConverter:
                 return False, "转换完成但输出文件不存在"
 
             file_size_kb = os.path.getsize(output_path) / 1024
-            print(f"OCR转换完成，文件大小: {file_size_kb:.1f}KB")
+            logger.info(f"OCR转换完成，文件大小: {file_size_kb:.1f}KB")
             return True, f"成功转换到: {output_path}"
 
         except MemoryError:
@@ -326,7 +335,7 @@ class PDFToWordConverter:
             doc.close()
             self._release_ocr_engine()
             error_msg = f"OCR转换失败: {str(e)}"
-            print(f"错误详情:\n{traceback.format_exc()}")
+            logger.error(f"错误详情:\n{traceback.format_exc()}")
             return False, error_msg
 
     def _extract_illustrations(
@@ -400,7 +409,7 @@ class PDFToWordConverter:
                 })
 
             except Exception as e:
-                print(f"提取插图时出错（页{page_idx + 1}, 图{img_idx}）: {e}")
+                logger.info(f"提取插图时出错（页{page_idx + 1}, 图{img_idx}）: {e}")
                 continue
 
         return illustrations
@@ -496,7 +505,7 @@ class PDFToWordConverter:
                     width = min(elem["width_inches"], 5.5)
                     run.add_picture(elem["path"], width=Inches(width))
                 except Exception as e:
-                    print(f"插入插图时出错: {e}")
+                    logger.info(f"插入插图时出错: {e}")
 
     def _merge_text_lines(
         self, content_elements: List[dict]
@@ -589,7 +598,7 @@ class PDFToWordConverter:
         stripped = text.strip()
         if len(stripped) <= 30 and not stripped.endswith(('。', '，', '；', '、', '：')):
             # 以"第X章"或"第X节"开头的通常是标题
-            if stripped.startswith(('第', '1', '2', '3', '4', '5', '6', '7', '8', '9')):
+            if stripped.startswith(('第', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9')):
                 return True
         return False
 
@@ -629,7 +638,7 @@ class PDFToWordConverter:
             # 检查文件大小，警告大文件
             file_size_mb = os.path.getsize(pdf_path) / (1024 * 1024)
             if file_size_mb > 50:
-                print(f"警告: 文件较大 ({file_size_mb:.1f}MB)，转换可能需要较长时间")
+                logger.info(f"警告: 文件较大 ({file_size_mb:.1f}MB)，转换可能需要较长时间")
 
             # 确保输出目录存在
             output_dir = Path(output_path).parent
@@ -645,13 +654,13 @@ class PDFToWordConverter:
                 )
 
             # 普通PDF：使用pdf2docx转换
-            print(f"开始转换: {pdf_path}")
+            logger.info(f"开始转换: {pdf_path}")
             self.converter = Converter(pdf_path)
 
             # 获取总页数
             total_pages = len(self.converter.pages)
             end = end or total_pages
-            print(f"总页数: {total_pages}")
+            logger.info(f"总页数: {total_pages}")
 
             # 使用自定义参数转换（禁用多进程，避免EXE崩溃）
             self.converter.convert(
@@ -677,13 +686,13 @@ class PDFToWordConverter:
             if os.path.getsize(output_path) == 0:
                 return False, "转换生成的文件为空"
 
-            print(f"转换完成，文件大小: {os.path.getsize(output_path) / 1024:.1f}KB")
+            logger.info(f"转换完成，文件大小: {os.path.getsize(output_path) / 1024:.1f}KB")
 
             # 后处理：修复图片显示问题
             try:
                 self._fix_images_in_docx(output_path)
             except Exception as e:
-                print(f"图片修复失败（不影响主文件）: {e}")
+                logger.info(f"图片修复失败（不影响主文件）: {e}")
 
             return True, f"成功转换到: {output_path}"
 
@@ -691,7 +700,7 @@ class PDFToWordConverter:
             if self.converter:
                 try:
                     self.converter.close()
-                except:
+                except Exception:
                     pass
             self.converter = None
             gc.collect()
@@ -701,19 +710,19 @@ class PDFToWordConverter:
             if self.converter:
                 try:
                     self.converter.close()
-                except:
+                except Exception:
                     pass
             self.converter = None
             return False, "转换被用户中断"
 
         except Exception as e:
             error_msg = f"转换失败: {str(e)}"
-            print(f"错误详情:\n{traceback.format_exc()}")
+            logger.error(f"错误详情:\n{traceback.format_exc()}")
 
             if self.converter:
                 try:
                     self.converter.close()
-                except:
+                except Exception:
                     pass
             self.converter = None
             gc.collect()
@@ -768,18 +777,12 @@ class PDFToWordConverter:
                         if image_part:
                             img = Image.open(io.BytesIO(image_part.blob))
                             img_rgb = img.convert('RGB')
-                            
-                            width, height = img_rgb.size
-                            total_pixels = width * height
-                            
-                            if total_pixels > 10000:
-                                samples = []
-                                for y in range(0, height, max(1, height // 100)):
-                                    for x in range(0, width, max(1, width // 100)):
-                                        samples.append(img_rgb.getpixel((x, y)))
-                            else:
-                                samples = list(img_rgb.getdata())
-                            
+
+                            # 缩略图分析：缩小到100x100后遍历，避免逐像素getpixel
+                            small_img = img_rgb.resize((100, 100), Image.LANCZOS)
+                            samples = list(small_img.getdata())
+                            small_img.close()
+
                             if samples:
                                 avg_r = sum(p[0] for p in samples) / len(samples)
                                 avg_g = sum(p[1] for p in samples) / len(samples)
@@ -790,13 +793,13 @@ class PDFToWordConverter:
                                 
                                 if min_channel > 240 and (max_channel - min_channel) < 15:
                                     is_blank_image = True
-                                    print(f"图片 {idx}: 检测到几乎纯白色图片（水印/分隔线），已删除")
+                                    logger.info(f"图片 {idx}: 检测到几乎纯白色图片（水印/分隔线），已删除")
                             
                             img.close()
                             img_rgb.close()
                         
                     except Exception as e:
-                        print(f"分析图片 {idx} 时出错: {e}")
+                        logger.info(f"分析图片 {idx} 时出错: {e}")
                     
                     if is_blank_image:
                         shapes_to_remove.append(idx)
@@ -805,14 +808,14 @@ class PDFToWordConverter:
                     max_reasonable_size = Inches(8)
                     if width_px > max_reasonable_size or height_px > max_reasonable_size:
                         shapes_to_remove.append(idx)
-                        print(f"图片 {idx}: 尺寸异常大，已删除")
+                        logger.info(f"图片 {idx}: 尺寸异常大，已删除")
                         continue
                     
                     if width_px > 0 and height_px > 0:
                         aspect_ratio = width_px / height_px
                         if aspect_ratio > 10 or aspect_ratio < 0.1:
                             shapes_to_remove.append(idx)
-                            print(f"图片 {idx}: 宽高比异常（{aspect_ratio:.2f}），可能是分隔线，已删除")
+                            logger.info(f"图片 {idx}: 宽高比异常（{aspect_ratio:.2f}），可能是分隔线，已删除")
                             continue
                     
                     max_width = Inches(6.5)
@@ -822,17 +825,17 @@ class PDFToWordConverter:
                         shape.height = max_width * aspect_ratio
                         
                 except Exception as e:
-                    print(f"处理图片 {idx} 时出错: {e}")
+                    logger.info(f"处理图片 {idx} 时出错: {e}")
                     continue
             
             if shapes_to_remove:
-                print(f"发现 {len(shapes_to_remove)} 个问题inline图片，正在清理...")
+                logger.info(f"发现 {len(shapes_to_remove)} 个问题inline图片，正在清理...")
                 self._remove_problematic_shapes(doc, shapes_to_remove)
             
             doc.save(docx_path)
             
         except Exception as e:
-            print(f"图片修复警告: {e}")
+            logger.info(f"图片修复警告: {e}")
     
     def _fix_anchor_drawings(self, body, doc=None):
         """
@@ -898,7 +901,7 @@ class PDFToWordConverter:
                         # 异常巨型浮动图片，无论是否behindDoc都删除
                         cx_inches = cx / 914400
                         cy_inches = cy / 914400
-                        print(f"删除异常巨型浮动图片: {cx_inches:.1f}x{cy_inches:.1f} 英寸, behindDoc={behind_doc}")
+                        logger.info(f"删除异常巨型浮动图片: {cx_inches:.1f}x{cy_inches:.1f} 英寸, behindDoc={behind_doc}")
                         should_remove = True
                     elif is_behind_doc:
                         # behindDoc=1的浮动图片需要分析内容，判断是水印还是有用图片
@@ -906,7 +909,7 @@ class PDFToWordConverter:
                         if is_watermark:
                             width_inches = cx / 914400
                             height_inches = cy / 914400
-                            print(f"删除背景浮动图片(水印): {width_inches:.1f}x{height_inches:.1f} 英寸")
+                            logger.info(f"删除背景浮动图片(水印): {width_inches:.1f}x{height_inches:.1f} 英寸")
                             should_remove = True
                             behind_removed_count += 1
                         else:
@@ -921,16 +924,16 @@ class PDFToWordConverter:
                             removed_count += 1
 
                 except Exception as e:
-                    print(f"处理anchor图片时出错: {e}")
+                    logger.info(f"处理anchor图片时出错: {e}")
                     continue
 
             if removed_count > 0:
-                print(f"共删除 {removed_count} 个浮动图片（其中背景水印 {behind_removed_count} 个）")
+                logger.info(f"共删除 {removed_count} 个浮动图片（其中背景水印 {behind_removed_count} 个）")
             if behind_preserved_count > 0:
-                print(f"保留 {behind_preserved_count} 个含内容的背景浮动图片")
+                logger.info(f"保留 {behind_preserved_count} 个含内容的背景浮动图片")
 
         except Exception as e:
-            print(f"修复浮动图片时出错: {e}")
+            logger.info(f"修复浮动图片时出错: {e}")
 
     def _is_watermark_image(self, drawing, doc, ns_a, ns_r):
         """
@@ -985,27 +988,17 @@ class PDFToWordConverter:
             # 分析图片像素内容
             img = Image.open(io.BytesIO(image_part.blob))
             img_rgb = img.convert('RGB')
-            width, height = img_rgb.size
 
-            # 采样分析像素亮度分布
-            total_samples = 0
-            dark_pixels = 0     # 深色像素（亮度 < 128），可能包含文字/线条
-            mid_pixels = 0      # 中等亮度像素（128 <= 亮度 < 220），可能包含图表/色块
-
-            step_y = max(1, height // 100)
-            step_x = max(1, width // 100)
-            for y in range(0, height, step_y):
-                for x in range(0, width, step_x):
-                    p = img_rgb.getpixel((x, y))
-                    total_samples += 1
-                    avg = (p[0] + p[1] + p[2]) / 3
-                    if avg < 128:
-                        dark_pixels += 1
-                    elif avg < 220:
-                        mid_pixels += 1
-
+            # 缩略图分析：缩小到100x100后遍历，避免逐像素getpixel
+            small_img = img_rgb.resize((100, 100), Image.LANCZOS)
+            pixels = list(small_img.getdata())
+            small_img.close()
             img.close()
             img_rgb.close()
+
+            total_samples = len(pixels)
+            dark_pixels = sum(1 for p in pixels if (p[0] + p[1] + p[2]) / 3 < 128)
+            mid_pixels = sum(1 for p in pixels if 128 <= (p[0] + p[1] + p[2]) / 3 < 220)
 
             if total_samples == 0:
                 return True
@@ -1051,7 +1044,7 @@ class PDFToWordConverter:
                         parent.remove(drawing)
                         
         except Exception as e:
-            print(f"删除问题图片时出错: {e}")
+            logger.info(f"删除问题图片时出错: {e}")
     
     def cancel(self):
         """取消转换"""
@@ -1059,6 +1052,6 @@ class PDFToWordConverter:
         if self.converter:
             try:
                 self.converter.close()
-            except:
+            except Exception:
                 pass
             self.converter = None

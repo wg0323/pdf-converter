@@ -3,7 +3,7 @@ chcp 65001 >nul
 title PDF Converter 打包脚本
 echo ==========================================
 echo    PDF Converter 打包工具
-echo    版本: 2.0.0
+echo    版本: 4.0.0
 echo ==========================================
 echo.
 

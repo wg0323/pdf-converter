@@ -17,7 +17,7 @@ a = Analysis(
         'docx',
         'docx.shared',
         'src.models.task_item',
-        'src.models.file_item',
+        'src.ui.styles.main_window_style',
         'src.core.task_manager',
         'src.core.single_task_worker',
         'src.core.pdf_to_word',

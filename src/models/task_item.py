@@ -29,8 +29,6 @@ class TaskItem:
     finished_at: Optional[float] = None
     
     # 格式选择
-    convert_to_word: bool = True
-    convert_to_markdown: bool = False
     output_type: str = "word"  # "word" 或 "markdown"
     
     # 输出设置

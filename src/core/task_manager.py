@@ -34,25 +34,21 @@ class TaskManager(QObject):
         self,
         file_path: str,
         output_dir: Optional[str] = None,
-        convert_to_word: bool = True,
-        convert_to_markdown: bool = False,
         custom_filename: Optional[str] = None,
         output_type: str = "word"
     ) -> str:
         """
         添加新任务到队列（不立即启动）
-        
+
         Returns:
             task_id: 任务唯一ID
         """
-        task_id = str(uuid.uuid4())[:8]  # 生成短ID
-        
+        task_id = str(uuid.uuid4())[:12]  # 生成短ID（12字符降低碰撞风险）
+
         task = TaskItem(
             task_id=task_id,
             file_path=file_path,
             output_dir=output_dir,
-            convert_to_word=convert_to_word,
-            convert_to_markdown=convert_to_markdown,
             custom_filename=custom_filename,
             output_type=output_type
         )
@@ -193,7 +189,25 @@ class TaskManager(QObject):
             return True
         
         return False
-    
+
+    def remove_task(self, task_id: str) -> bool:
+        """
+        从队列中移除等待中的任务（不标记为取消）
+
+        Args:
+            task_id: 任务ID
+
+        Returns:
+            是否成功移除
+        """
+        if task_id in self.pending_queue:
+            self.pending_queue.remove(task_id)
+            if task_id in self.tasks:
+                del self.tasks[task_id]
+            self._update_queue_status()
+            return True
+        return False
+
     def cancel_all_tasks(self):
         """取消所有任务"""
         self.is_running = False
@@ -209,7 +223,9 @@ class TaskManager(QObject):
             if task_id in self.workers:
                 worker = self.workers[task_id]
                 worker.cancel()
-        
+                worker.wait(2000)  # 等待线程结束
+
+        self.running_tasks.clear()
         self._update_queue_status()
     
     def get_task(self, task_id: str) -> Optional[TaskItem]:
