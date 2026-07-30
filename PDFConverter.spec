@@ -21,17 +21,6 @@ a = Analysis(
         'src.core.single_task_worker',
         'src.core.pdf_to_word',
         'src.ui.main_window_v2',
-        # PaddleOCR 相关依赖（可选，如果安装了则打包）
-        'paddleocr',
-        'paddle',
-        'paddle.dataset',
-        'shapely',
-        'pyclipper',
-        'lmdb',
-        'scipy',
-        'skimage',
-        'albumentations',
-        'rapidfuzz',
     ],
     hookspath=[],
     hooksconfig={},
@@ -47,6 +36,20 @@ a = Analysis(
         'pytest',
         'setuptools',
         'pip',
+        # PaddleOCR 不再打包（体积/打包时间最大来源）；
+        # 代码内为函数内懒导入，缺失时扫描版PDF自动降级为图片模式
+        'paddleocr',
+        'paddle',
+        'paddlex',
+        'shapely',
+        'pyclipper',
+        'lmdb',
+        'scipy',
+        'skimage',
+        'albumentations',
+        'rapidfuzz',
+        # 间接拉入但本项目及 pdf2docx 均不使用
+        'pandas',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -59,17 +62,13 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='PDFConverter',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -77,4 +76,17 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon='resources/icons/app.ico' if os.path.exists('resources/icons/app.ico') else None,
+)
+
+# 目录模式（onedir）：启动无需自解压到临时目录，大幅提升启动速度；
+# UPX 禁用：避免构建时逐个压缩 DLL 与运行时解压开销
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    upx_exclude=[],
+    name='PDFConverter',
 )

@@ -41,3 +41,4 @@ crash_log.txt
 
 # 输入/测试用 PDF 文件（不纳入版本库）
 *.pdf
+/docs

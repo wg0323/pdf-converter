@@ -108,6 +108,9 @@ class TaskManager(QObject):
         self.running_tasks.add(task_id)
         
         self.task_started.emit(task_id)
+        # 任务已从等待队列转入运行集合，立即刷新队列统计，
+        # 否则界面会停留在"任务仍在等待中"的旧计数上
+        self._update_queue_status()
         worker.start()
     
     def _cleanup_worker(self, task_id: str):
@@ -236,6 +239,17 @@ class TaskManager(QObject):
                     and task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)):
                 return True
         return False
+    
+    def update_pending_output_dir(self, output_dir: Optional[str]):
+        """将新的输出目录同步到所有等待中的任务
+
+        输出目录在添加任务时快照进 TaskItem，若用户先添加文件、后选目录，
+        需要把新目录同步到已入队但尚未开始的任务，否则配置不生效。
+        运行中/已完成任务的输出路径已确定，不做修改。
+        """
+        for task in self.tasks.values():
+            if task.status == TaskStatus.PENDING:
+                task.output_dir = output_dir
     
     def get_task(self, task_id: str) -> Optional[TaskItem]:
         """获取任务信息"""

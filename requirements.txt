@@ -4,5 +4,6 @@ PyMuPDF>=1.24.0
 Pillow>=10.0.0
 python-docx>=1.1.0
 PyInstaller>=6.0.0
-paddleocr>=2.7,<3.0
-paddlepaddle>=2.5,<3.0
+# 可选：安装后开发环境扫描版PDF可用OCR文字识别（不再随安装包分发）
+# paddleocr>=2.7,<3.0
+# paddlepaddle>=2.5,<3.0

@@ -5,6 +5,9 @@ echo    PDF Converter Build Tool
 echo    Version: 4.0.0
 echo ==========================================
 echo.
+echo Usage: build.bat        (fast incremental build)
+echo        build.bat full   (install deps + clean rebuild)
+echo.
 
 REM Check Python environment
 echo [1/5] Checking Python environment...
@@ -16,30 +19,40 @@ if errorlevel 1 (
 )
 echo [OK] Python environment is ready
 
-REM Check dependencies
+REM Install dependencies only in full mode (skip for fast incremental builds)
 echo.
-echo [2/5] Checking and installing dependencies...
-pip install -r requirements.txt -q
-if errorlevel 1 (
-    echo [ERROR] Failed to install dependencies
-    pause
-    exit /b 1
+if /i "%~1"=="full" (
+    echo [2/5] Installing dependencies...
+    pip install -r requirements.txt -q
+    if errorlevel 1 (
+        echo [ERROR] Failed to install dependencies
+        pause
+        exit /b 1
+    )
+    echo [OK] Dependencies installed
+) else (
+    echo [2/5] Skipping dependency install ^(use "build.bat full" to install^)
 )
-echo [OK] Dependencies installed
 
-REM Clean old build files
+REM Clean: full mode wipes PyInstaller cache; fast mode keeps build\ for incremental speed
 echo.
-echo [3/5] Cleaning old build files...
-if exist "build" rmdir /s /q "build"
+echo [3/5] Preparing build directories...
+if /i "%~1"=="full" (
+    if exist "build" rmdir /s /q "build"
+)
 if exist "dist" rmdir /s /q "dist"
-echo [OK] Cleanup finished
+echo [OK] Ready
 
-REM Run PyInstaller
+REM Run PyInstaller (--clean only in full mode, incremental cache speeds up rebuilds)
 echo.
 echo [4/5] Building...
 echo This may take several minutes, please wait...
 echo.
-pyinstaller PDFConverter.spec --clean -y
+if /i "%~1"=="full" (
+    pyinstaller PDFConverter.spec --clean -y
+) else (
+    pyinstaller PDFConverter.spec -y
+)
 
 if errorlevel 1 (
     echo.
@@ -48,26 +61,28 @@ if errorlevel 1 (
     exit /b 1
 )
 
-REM Check output file
+REM Check output file (onedir mode: dist\PDFConverter\PDFConverter.exe)
 echo.
 echo [5/5] Checking output file...
-if exist "dist\PDFConverter.exe" (
+if exist "dist\PDFConverter\PDFConverter.exe" (
     echo [OK] Build succeeded!
     echo.
     echo ==========================================
     echo    Build Completed!
     echo ==========================================
     echo.
-    echo Output file: dist\PDFConverter.exe
+    echo Output folder: dist\PDFConverter\
+    echo Launcher:      dist\PDFConverter\PDFConverter.exe
     
     REM Get file size
-    for %%I in ("dist\PDFConverter.exe") do (
-        echo File size: %%~zI bytes
+    for %%I in ("dist\PDFConverter\PDFConverter.exe") do (
+        echo Launcher size: %%~zI bytes
     )
     
     echo.
     echo Usage:
-    echo   Double-click dist\PDFConverter.exe to run
+    echo   Distribute the whole dist\PDFConverter folder
+    echo   Double-click PDFConverter.exe inside it to run
     echo.
     echo Features:
     echo   - PDF to Word (.docx)

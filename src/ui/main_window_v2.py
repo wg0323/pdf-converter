@@ -317,6 +317,8 @@ class MainWindow(QMainWindow):
         directory = QFileDialog.getExistingDirectory(self, '选择输出目录', '')
         if directory:
             self.output_path_edit.setText(directory)
+            # 同步到已添加但尚未开始的任务，避免"先添加文件、后选目录"时配置不生效
+            self.task_manager.update_pending_output_dir(directory)
     
     def start_conversion(self):
         """开始转换所有等待中的任务"""
@@ -346,10 +348,10 @@ class MainWindow(QMainWindow):
         """打开输出目录"""
         output_dir = self.output_path_edit.text()
         if not output_dir:
-            # 获取第一个任务的输出目录
+            # 获取第一个任务的输出目录（优先任务实际的输出目录，再回退源文件目录）
             tasks = self.task_manager.get_all_tasks()
             if tasks:
-                output_dir = tasks[0].file_dir
+                output_dir = tasks[0].output_dir or tasks[0].file_dir
         
         if output_dir and os.path.exists(output_dir):
             QDesktopServices.openUrl(QUrl.fromLocalFile(output_dir))

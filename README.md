@@ -62,10 +62,11 @@ python src/main.py
 ## 打包
 
 ```bash
-build.bat
+build.bat        # 快速增量打包（保留缓存，日常使用）
+build.bat full   # 完整打包（安装依赖 + 清理缓存重新分析）
 ```
 
-产物输出至 `dist\PDFConverter.exe`（单文件，含图标资源）。
+产物输出至 `dist\PDFConverter\` 目录（目录模式，启动无需自解压），分发时打包整个文件夹，双击其中 `PDFConverter.exe` 运行。安装包不含 PaddleOCR，扫描版 PDF 以图片模式转换。
 
 ## 测试
 
@@ -83,7 +84,7 @@ python tests/test_conversion.py
 - [x] 任务队列调度（20 任务上限、串行执行）
 - [x] Word 文档图片修复（水印清理、异常浮动图处理、空白图删除）
 - [x] Element Plus 风格 UI、拖拽添加、任务智能排序
-- [x] PyInstaller 单文件打包
+- [x] PyInstaller 打包（目录模式）
 - [x] 代码审查改进（2026-07）：
   - 修复跨线程取消竞争与 QThread 销毁崩溃（改为协作式取消 + finished 信号延迟清理）
   - 修复任务行号缓存失效导致的 UI 状态错位
@@ -94,6 +95,9 @@ python tests/test_conversion.py
 - [x] 移除输出格式选择入口，固定为 PDF 转 Word（2026-07）
 - [x] 修复并发转换闪退（2026-07）：底层 pdf2docx/PyMuPDF/PaddleOCR 非线程安全，改为串行执行；新增 faulthandler + excepthook 崩溃日志（crash_log.txt）
 - [x] 修复大文档转换整体闪退（2026-07）：定位到 PyMuPDF C 扩展在解析特定文档时 refcount 崩溃（Python 无法捕获）。将 pdf2docx 转换放入独立子进程隔离，子进程崩溃时主程序存活并将该任务标记为失败，不再拖垮整个应用
+- [x] 修复队列统计计数错误（2026-07）：任务从等待队列转入运行集合时未发出 queue_updated 信号，导致"转换中"任务仍被界面计入等待中、运行中显示 0；在 _start_task 中补发队列状态刷新
+- [x] 修复输出目录配置失效（2026-07）：输出目录在添加任务时快照，"先添加文件、后选目录"时已入队任务仍回退到源文件目录；现在选定新目录后自动同步到所有等待中任务，"打开输出目录"也优先使用任务实际输出目录
+- [x] 优化打包与启动速度（2026-07）：打包改为目录模式（启动免自解压）、禁用 UPX、移出 PaddleOCR/paddle 及 pandas 等无用依赖（扫描版 PDF 降级图片模式）；pdf2docx 改为懒加载（开发环境导入耗时 0.47s→0.10s）；build.bat 默认增量构建（保留缓存/跳过依赖安装，full 参数完整构建）
 
 ### 下一步计划
 

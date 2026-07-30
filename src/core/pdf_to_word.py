@@ -5,8 +5,11 @@ import traceback
 import tempfile
 import multiprocessing
 from pathlib import Path
-from typing import Optional, List, Tuple
-from pdf2docx import Converter
+from typing import Optional, List, Tuple, TYPE_CHECKING
+
+# pdf2docx 导入链很重（PyMuPDF/numpy/opencv），懒加载以免拖慢主程序启动
+if TYPE_CHECKING:
+    from pdf2docx import Converter
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,7 @@ def _pdf2docx_worker(pdf_path, output_path, start, end, result_queue):
     感知并优雅报错，不会被整体拖垮。
     """
     try:
+        from pdf2docx import Converter
         cv = Converter(pdf_path)
         cv.convert(
             output_path,
@@ -38,7 +42,7 @@ def _pdf2docx_worker(pdf_path, output_path, start, end, result_queue):
 
 class PDFToWordConverter:
     def __init__(self):
-        self.converter: Optional[Converter] = None
+        self.converter: Optional["Converter"] = None
         self._ocr_engine = None
         self._is_cancelled = False
         self._process: Optional[multiprocessing.Process] = None
