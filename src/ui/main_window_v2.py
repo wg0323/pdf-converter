@@ -171,7 +171,7 @@ class MainWindow(QMainWindow):
         self.task_table.setColumnWidth(3, 110)
         self.task_table.setMinimumHeight(300)
         # 固定行高，保证行内删除按钮能完整显示
-        self.task_table.verticalHeader().setDefaultSectionSize(46)
+        self.task_table.verticalHeader().setDefaultSectionSize(48)
         self.task_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.task_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.task_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -290,7 +290,6 @@ class MainWindow(QMainWindow):
         btn = QPushButton('删除')
         btn.setObjectName('deleteRow')
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setFixedSize(64, 30)
         btn.clicked.connect(lambda checked=False, tid=task_id: self._delete_task(tid))
         layout.addWidget(btn)
         return container

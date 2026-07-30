@@ -76,7 +76,7 @@ QPushButton#primary:disabled {
 
 QPushButton#deleteRow {
     min-width: 0px;
-    padding: 2px 6px;
+    padding: 5px 18px;
     font-size: 13px;
     color: #f56c6c;
     background-color: #ffffff;
@@ -129,7 +129,7 @@ QTableWidget {
 }
 
 QTableWidget::item {
-    padding: 8px;
+    padding: 4px 10px;
     border: none;
 }
 
