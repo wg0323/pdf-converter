@@ -1,87 +1,85 @@
 @echo off
-chcp 65001 >nul
-title PDF Converter 打包脚本
+title PDF Converter Build Script
 echo ==========================================
-echo    PDF Converter 打包工具
-echo    版本: 4.0.0
+echo    PDF Converter Build Tool
+echo    Version: 4.0.0
 echo ==========================================
 echo.
 
-REM 检查Python环境
-echo [1/5] 检查Python环境...
+REM Check Python environment
+echo [1/5] Checking Python environment...
 python --version >nul 2>&1
 if errorlevel 1 (
-    echo [错误] 未找到Python，请确保Python已安装并添加到PATH
+    echo [ERROR] Python not found. Please make sure Python is installed and added to PATH.
     pause
     exit /b 1
 )
-echo [OK] Python环境正常
+echo [OK] Python environment is ready
 
-REM 检查依赖
+REM Check dependencies
 echo.
-echo [2/5] 检查并安装依赖...
+echo [2/5] Checking and installing dependencies...
 pip install -r requirements.txt -q
 if errorlevel 1 (
-    echo [错误] 依赖安装失败
+    echo [ERROR] Failed to install dependencies
     pause
     exit /b 1
 )
-echo [OK] 依赖安装完成
+echo [OK] Dependencies installed
 
-REM 清理旧的构建文件
+REM Clean old build files
 echo.
-echo [3/5] 清理旧的构建文件...
+echo [3/5] Cleaning old build files...
 if exist "build" rmdir /s /q "build"
 if exist "dist" rmdir /s /q "dist"
-echo [OK] 清理完成
+echo [OK] Cleanup finished
 
-REM 执行打包
+REM Run PyInstaller
 echo.
-echo [4/5] 开始打包...
-echo 这可能需要几分钟时间，请耐心等待...
+echo [4/5] Building...
+echo This may take several minutes, please wait...
 echo.
 pyinstaller PDFConverter.spec --clean -y
 
 if errorlevel 1 (
     echo.
-    echo [错误] 打包失败！
+    echo [ERROR] Build failed!
     pause
     exit /b 1
 )
 
-REM 检查输出文件
+REM Check output file
 echo.
-echo [5/5] 检查输出文件...
+echo [5/5] Checking output file...
 if exist "dist\PDFConverter.exe" (
-    echo [OK] 打包成功！
+    echo [OK] Build succeeded!
     echo.
     echo ==========================================
-    echo    打包完成！
+    echo    Build Completed!
     echo ==========================================
     echo.
-    echo 输出文件: dist\PDFConverter.exe
+    echo Output file: dist\PDFConverter.exe
     
-    REM 获取文件大小
+    REM Get file size
     for %%I in ("dist\PDFConverter.exe") do (
-        echo 文件大小: %%~zI 字节
+        echo File size: %%~zI bytes
     )
     
     echo.
-    echo 使用方法:
-    echo   双击运行 dist\PDFConverter.exe
+    echo Usage:
+    echo   Double-click dist\PDFConverter.exe to run
     echo.
-    echo 功能特点:
-    echo   - PDF转Word (.docx) 
-    echo   - PDF转Markdown (.md)
-    echo   - 任务队列管理
-    echo   - 并发转换 (最多3个)
-    echo   - 黑色猫主题图标
+    echo Features:
+    echo   - PDF to Word (.docx)
+    echo   - Task queue management
+    echo   - Sequential conversion (stable)
+    echo   - Black cat theme icon
     echo.
 ) else (
-    echo [错误] 未找到输出文件
+    echo [ERROR] Output file not found
     pause
     exit /b 1
 )
 
-echo 按任意键退出...
+echo Press any key to exit...
 pause >nul

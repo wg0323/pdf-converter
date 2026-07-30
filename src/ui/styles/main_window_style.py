@@ -74,6 +74,32 @@ QPushButton#primary:disabled {
     border-color: #a0cfff;
 }
 
+QPushButton#deleteRow {
+    min-width: 0px;
+    padding: 2px 6px;
+    font-size: 13px;
+    color: #f56c6c;
+    background-color: #ffffff;
+    border: 1px solid #fbc4c4;
+    border-radius: 4px;
+}
+
+QPushButton#deleteRow:hover {
+    background-color: #fef0f0;
+    border-color: #f56c6c;
+    color: #f56c6c;
+}
+
+QPushButton#deleteRow:pressed {
+    background-color: #fde2e2;
+}
+
+QPushButton#deleteRow:disabled {
+    color: #c0c4cc;
+    border-color: #e4e7ed;
+    background-color: #f5f7fa;
+}
+
 QLineEdit {
     border: 1px solid #dcdfe6;
     border-radius: 6px;

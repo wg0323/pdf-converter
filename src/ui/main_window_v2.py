@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QTableWidget, QTableWidgetItem, QCheckBox,
+    QPushButton, QTableWidget, QTableWidgetItem,
     QLabel, QFileDialog, QGroupBox, QMessageBox,
     QLineEdit, QAbstractItemView, QPlainTextEdit,
     QHeaderView
@@ -99,18 +99,6 @@ class MainWindow(QMainWindow):
         self.add_files_btn.setObjectName('primary')
         row1_layout.addWidget(self.add_files_btn)
         
-        # 删除选中任务按钮
-        self.remove_selected_btn = QPushButton(' 删除选中')
-        self.remove_selected_btn.setIcon(self._load_icon('delete.png'))
-        self.remove_selected_btn.setEnabled(False)
-        row1_layout.addWidget(self.remove_selected_btn)
-        
-        # 格式选择 - 仅 Word
-        row1_layout.addWidget(QLabel('输出格式:'))
-        self.word_checkbox = QCheckBox('Word (.docx)')
-        self.word_checkbox.setChecked(True)
-        row1_layout.addWidget(self.word_checkbox)
-        
         row1_layout.addStretch()
         control_layout.addLayout(row1_layout)
         
@@ -163,29 +151,30 @@ class MainWindow(QMainWindow):
         task_layout = QVBoxLayout(task_group)
         
         # 提示标签
-        hint_label = QLabel('提示：选中任务后可点击"删除选中"移除')
+        hint_label = QLabel('提示：点击任务行末尾的"删除"按钮可移除等待中的任务')
         hint_label.setStyleSheet('color: #909399; font-size: 12px;')
         task_layout.addWidget(hint_label)
         
-        # 任务表格 - 3 列：任务名、状态、用时
+        # 任务表格 - 4 列：任务名、状态、用时、操作
         self.task_table = QTableWidget()
-        self.task_table.setColumnCount(3)
+        self.task_table.setColumnCount(4)
         self.task_table.setHorizontalHeaderLabels([
-            '任务名', '状态', '用时'
+            '任务名', '状态', '用时', '操作'
         ])
         self.task_table.horizontalHeader().setStretchLastSection(False)
         self.task_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.task_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
         self.task_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self.task_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.task_table.setColumnWidth(1, 100)
         self.task_table.setColumnWidth(2, 100)
+        self.task_table.setColumnWidth(3, 110)
         self.task_table.setMinimumHeight(300)
+        # 固定行高，保证行内删除按钮能完整显示
+        self.task_table.verticalHeader().setDefaultSectionSize(46)
         self.task_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.task_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.task_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        
-        # 连接选择变化信号，用于更新删除按钮状态
-        self.task_table.itemSelectionChanged.connect(self.on_selection_changed)
         
         task_layout.addWidget(self.task_table)
         
@@ -217,7 +206,6 @@ class MainWindow(QMainWindow):
     def setup_connections(self):
         """连接信号"""
         self.add_files_btn.clicked.connect(self.add_files)
-        self.remove_selected_btn.clicked.connect(self.remove_selected_tasks)
         self.browse_output_btn.clicked.connect(self.browse_output_directory)
         self.start_convert_btn.clicked.connect(self.start_conversion)
         self.clear_log_btn.clicked.connect(self.clear_log)
@@ -237,7 +225,15 @@ class MainWindow(QMainWindow):
         self._is_converting = is_converting
         self.add_files_btn.setEnabled(not is_converting)
         self.start_convert_btn.setEnabled(not is_converting and self.task_manager.has_pending_tasks())
-        self.remove_selected_btn.setEnabled(not is_converting and len(self.task_table.selectedItems()) > 0)
+        # 转换期间禁用各行的删除按钮
+        self._set_delete_buttons_enabled(not is_converting)
+    
+    def _set_delete_buttons_enabled(self, enabled: bool):
+        """统一启用/禁用任务列表各行的删除按钮"""
+        for row in range(self.task_table.rowCount()):
+            btn = self.task_table.cellWidget(row, 3)
+            if btn is not None:
+                btn.setEnabled(enabled)
     
     def add_files(self):
         """添加文件"""
@@ -257,87 +253,66 @@ class MainWindow(QMainWindow):
         if not files:
             return
         
-        # 检查格式选择
-        convert_to_word = self.word_checkbox.isChecked()
-        
-        if not convert_to_word:
-            QMessageBox.warning(self, '警告', '请选择输出格式！')
-            return
-        
         output_dir = self.output_path_edit.text() or None
         
         added_count = 0
+        skipped_count = 0
         for file_path in files:
             # 检查是否已达到任务上限
             if self.task_manager.is_queue_full():
                 QMessageBox.warning(self, '警告', f'已添加 {added_count} 个任务，队列已满。')
                 break
             
+            # 去重：跳过已在队列中的相同任务，避免并发写同一输出文件
+            if self.task_manager.has_active_duplicate(file_path, output_dir):
+                skipped_count += 1
+                continue
+            
             self.task_manager.add_task(
                 file_path=file_path,
-                output_dir=output_dir,
-                output_type="word"
+                output_dir=output_dir
             )
             added_count += 1
         
+        if skipped_count > 0:
+            self.add_log(f'已跳过 {skipped_count} 个重复任务', 'WARNING')
         if added_count > 0:
             self.add_log(f'已添加 {added_count} 个任务到转换队列（Word 格式）')
             self.start_convert_btn.setEnabled(True)
             self.open_output_dir_btn.setEnabled(True)
     
-    def on_selection_changed(self):
-        """任务列表选择变化时更新删除按钮状态"""
+    def _create_delete_button(self, task_id: str) -> QWidget:
+        """创建某行的删除按钮（固定尺寸居中，行高/列宽留足余量，不被裁剪）"""
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        btn = QPushButton('删除')
+        btn.setObjectName('deleteRow')
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setFixedSize(64, 30)
+        btn.clicked.connect(lambda checked=False, tid=task_id: self._delete_task(tid))
+        layout.addWidget(btn)
+        return container
+
+    def _delete_task(self, task_id: str):
+        """删除指定的等待中任务（由行内删除按钮触发）"""
         if self._is_converting:
             return
-        selected_rows = set()
-        for item in self.task_table.selectedItems():
-            selected_rows.add(item.row())
-        # 只有选中了等待中的任务才能删除
-        has_removable = False
-        for row in selected_rows:
-            item = self.task_table.item(row, 0)
-            if item:
-                task_id = item.data(Qt.ItemDataRole.UserRole)
-                if task_id:
-                    task = self.task_manager.get_task(task_id)
-                    if task and task.status == TaskStatus.PENDING:
-                        has_removable = True
-                        break
-        self.remove_selected_btn.setEnabled(has_removable)
-    
-    def remove_selected_tasks(self):
-        """删除选中的等待中任务"""
-        if self._is_converting:
+        task = self.task_manager.get_task(task_id)
+        # 只能删除等待中的任务
+        if not task or task.status != TaskStatus.PENDING:
             return
-
-        rows_to_remove = []
-        selected_rows = set()
-        for item in self.task_table.selectedItems():
-            selected_rows.add(item.row())
-
-        for row in selected_rows:
-            item = self.task_table.item(row, 0)
-            if item:
-                task_id = item.data(Qt.ItemDataRole.UserRole)
-                if task_id:
-                    task = self.task_manager.get_task(task_id)
-                    # 只能删除等待中的任务
-                    if task and task.status == TaskStatus.PENDING:
-                        rows_to_remove.append(row)
-                        # 通过 TaskManager 封装方法移除
-                        self.task_manager.remove_task(task_id)
-                        self.add_log(f'已删除任务: {task.file_name}')
-
-        # 按行号倒序删除，避免索引变化
-        for row in sorted(rows_to_remove, reverse=True):
+        if not self.task_manager.remove_task(task_id):
+            return
+        self.add_log(f'已删除任务: {task.file_name}')
+        row = self._find_row_by_task_id(task_id)
+        if row >= 0:
             self.task_table.removeRow(row)
-
-        self.remove_selected_btn.setEnabled(False)
-
         # 如果没有等待中的任务了，禁用开始按钮
         if not self.task_manager.has_pending_tasks() and self.task_table.rowCount() == 0:
             self.start_convert_btn.setEnabled(False)
-    
+
     def browse_output_directory(self):
         """选择输出目录"""
         directory = QFileDialog.getExistingDirectory(self, '选择输出目录', '')
@@ -411,6 +386,9 @@ class MainWindow(QMainWindow):
         # 用时
         self.task_table.setItem(row, 2, QTableWidgetItem('-'))
         
+        # 操作 - 行内删除按钮（仅等待中任务可用）
+        self.task_table.setCellWidget(row, 3, self._create_delete_button(task_id))
+        
         self.add_log(f'添加任务：{task.file_name} → {type_text}')
     
     def on_task_started(self, task_id: str):
@@ -473,15 +451,21 @@ class MainWindow(QMainWindow):
             if not has_pending:
                 self.start_convert_btn.setText(' 开始转换')
     
+    def _find_row_by_task_id(self, task_id: str) -> int:
+        """线性查找任务所在行，未找到返回 -1"""
+        for i in range(self.task_table.rowCount()):
+            item = self.task_table.item(i, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
+                return i
+        return -1
+
     def update_task_row(self, task_id: str):
         """更新任务行显示，已完成的任务移到后面"""
+        # 缓存行号可能因行移动而失效，必须校验该行的 task_id 是否匹配
         row = self._running_rows.get(task_id, -1)
-        if row < 0 or row >= self.task_table.rowCount():
-            for i in range(self.task_table.rowCount()):
-                item = self.task_table.item(i, 0)
-                if item and item.data(Qt.ItemDataRole.UserRole) == task_id:
-                    row = i
-                    break
+        item = self.task_table.item(row, 0) if 0 <= row < self.task_table.rowCount() else None
+        if not item or item.data(Qt.ItemDataRole.UserRole) != task_id:
+            row = self._find_row_by_task_id(task_id)
 
         if row < 0:
             return
@@ -514,6 +498,10 @@ class MainWindow(QMainWindow):
         status_item = QTableWidgetItem(status_text)
         status_item.setForeground(status_color)
         self.task_table.setItem(row, 1, status_item)
+
+        # 非等待状态移除删除按钮（只有等待中的任务可删除）
+        if task.status != TaskStatus.PENDING:
+            self.task_table.removeCellWidget(row, 3)
 
         # 更新用时
         if task.status in [TaskStatus.RUNNING, TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED]:
@@ -588,13 +576,23 @@ class MainWindow(QMainWindow):
     def refresh_task_list(self):
         """刷新任务列表（只更新运行中任务的用时）"""
         for task_id, row in list(self._running_rows.items()):
-            if row < self.task_table.rowCount():
-                task = self.task_manager.get_task(task_id)
-                if task and task.status == TaskStatus.RUNNING:
-                    self.task_table.setItem(row, 2, QTableWidgetItem(task.elapsed_time_str))
-                elif task and task.status != TaskStatus.RUNNING:
-                    # 任务不再是运行状态，停止追踪
+            task = self.task_manager.get_task(task_id)
+            if not task:
+                self._running_rows.pop(task_id, None)
+                continue
+            if task.status != TaskStatus.RUNNING:
+                # 任务不再是运行状态，停止追踪
+                self._running_rows.pop(task_id, None)
+                continue
+            # 校验缓存行号有效性，失效则重新查找并更新缓存
+            item = self.task_table.item(row, 0) if 0 <= row < self.task_table.rowCount() else None
+            if not item or item.data(Qt.ItemDataRole.UserRole) != task_id:
+                row = self._find_row_by_task_id(task_id)
+                if row < 0:
                     self._running_rows.pop(task_id, None)
+                    continue
+                self._running_rows[task_id] = row
+            self.task_table.setItem(row, 2, QTableWidgetItem(task.elapsed_time_str))
     
     # ============ 其他方法 ============
     
@@ -619,26 +617,28 @@ class MainWindow(QMainWindow):
         if not pdf_files:
             return
         
-        convert_to_word = self.word_checkbox.isChecked()
         output_dir = self.output_path_edit.text() or None
         
-        if not convert_to_word:
-            QMessageBox.warning(self, '警告', '请选择输出格式！')
-            return
-        
         added_count = 0
+        skipped_count = 0
         for file_path in pdf_files:
             if self.task_manager.is_queue_full():
                 QMessageBox.warning(self, '警告', f'已添加 {added_count} 个任务，队列已满。')
                 break
             
+            # 去重：跳过已在队列中的相同任务，避免并发写同一输出文件
+            if self.task_manager.has_active_duplicate(file_path, output_dir):
+                skipped_count += 1
+                continue
+            
             self.task_manager.add_task(
                 file_path=file_path,
-                output_dir=output_dir,
-                output_type="word"
+                output_dir=output_dir
             )
             added_count += 1
         
+        if skipped_count > 0:
+            self.add_log(f'已跳过 {skipped_count} 个重复任务', 'WARNING')
         if added_count > 0:
             self.add_log(f'通过拖拽添加 {added_count} 个任务（Word 格式）')
             self.start_convert_btn.setEnabled(True)
@@ -670,5 +670,7 @@ class MainWindow(QMainWindow):
                 return
         
         self.task_manager.cancel_all_tasks()
+        # 必须等待工作线程结束后再退出，否则运行中的QThread被销毁会导致崩溃
+        self.task_manager.wait_all_workers(5000)
         self.refresh_timer.stop()
         event.accept()

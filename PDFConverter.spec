@@ -12,7 +12,6 @@ a = Analysis(
     ],
     hiddenimports=[
         'pdf2docx',
-        'pdfplumber',
         'PyQt6.sip',
         'docx',
         'docx.shared',
@@ -21,7 +20,6 @@ a = Analysis(
         'src.core.task_manager',
         'src.core.single_task_worker',
         'src.core.pdf_to_word',
-        'src.core.pdf_to_markdown',
         'src.ui.main_window_v2',
         # PaddleOCR 相关依赖（可选，如果安装了则打包）
         'paddleocr',
@@ -32,7 +30,6 @@ a = Analysis(
         'lmdb',
         'scipy',
         'skimage',
-        'imgaug',
         'albumentations',
         'rapidfuzz',
     ],

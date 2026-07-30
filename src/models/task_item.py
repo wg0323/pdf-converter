@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional
 from enum import Enum
 import time
 
@@ -20,7 +20,6 @@ class TaskItem:
     file_path: str                  # PDF文件路径
     status: TaskStatus = TaskStatus.PENDING
     output_word: Optional[str] = None
-    output_markdown: Optional[str] = None
     error_message: Optional[str] = None
     
     # 时间统计
@@ -28,15 +27,9 @@ class TaskItem:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     
-    # 格式选择
-    output_type: str = "word"  # "word" 或 "markdown"
-    
     # 输出设置
     output_dir: Optional[str] = None
     custom_filename: Optional[str] = None  # 自定义文件名（不含扩展名）
-    
-    # 进度回调
-    progress_callback: Optional[Callable] = None
     
     @property
     def file_name(self) -> str:
@@ -72,14 +65,14 @@ class TaskItem:
             return f"{minutes}分{seconds}秒"
     
     def get_output_path(self, extension: str = ".docx") -> str:
-        """获取输出文件路径"""
+        """获取输出文件路径（同名文件已存在时自动追加序号，避免静默覆盖）"""
         output_dir = self.output_dir if self.output_dir else self.file_dir
-        return str(Path(output_dir) / f"{self.base_name}{extension}")
-    
-    def get_markdown_folder_path(self) -> str:
-        """获取Markdown输出文件夹路径"""
-        output_dir = self.output_dir if self.output_dir else self.file_dir
-        return str(Path(output_dir) / self.base_name)
+        path = Path(output_dir) / f"{self.base_name}{extension}"
+        counter = 1
+        while path.exists():
+            path = Path(output_dir) / f"{self.base_name}({counter}){extension}"
+            counter += 1
+        return str(path)
     
     def start(self):
         """标记任务开始"""

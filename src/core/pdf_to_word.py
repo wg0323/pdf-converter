@@ -3,6 +3,7 @@ import gc
 import logging
 import traceback
 import tempfile
+import multiprocessing
 from pathlib import Path
 from typing import Optional, List, Tuple
 from pdf2docx import Converter
@@ -10,11 +11,37 @@ from pdf2docx import Converter
 logger = logging.getLogger(__name__)
 
 
+def _pdf2docx_worker(pdf_path, output_path, start, end, result_queue):
+    """
+    在独立子进程中执行 pdf2docx 转换。
+
+    pdf2docx 依赖的 PyMuPDF C 扩展在解析某些文档时可能触发 refcount 错误
+    等原生崩溃，这类崩溃无法被 Python 的 try/except 捕获，会直接终止进程。
+    放到子进程执行后，即使崩溃也只是子进程退出，父进程（GUI）通过 exitcode
+    感知并优雅报错，不会被整体拖垮。
+    """
+    try:
+        cv = Converter(pdf_path)
+        cv.convert(
+            output_path,
+            start=start,
+            end=end,
+            pages=None,
+            debug=False,
+            multi_processing=False,
+        )
+        cv.close()
+        result_queue.put((True, ""))
+    except Exception as e:
+        result_queue.put((False, f"转换失败: {e}"))
+
+
 class PDFToWordConverter:
     def __init__(self):
         self.converter: Optional[Converter] = None
         self._ocr_engine = None
         self._is_cancelled = False
+        self._process: Optional[multiprocessing.Process] = None
 
     # ========== 扫描版PDF检测 ==========
 
@@ -34,22 +61,22 @@ class PDFToWordConverter:
         try:
             import fitz
             doc = fitz.open(pdf_path)
-            total = len(doc)
-            check_count = min(sample_pages, total)
+            try:
+                total = len(doc)
+                check_count = min(sample_pages, total)
 
-            if check_count == 0:
+                if check_count == 0:
+                    return False
+
+                no_text_count = 0
+                for i in range(check_count):
+                    page = doc[i]
+                    text = page.get_text().strip()
+                    images = page.get_images()
+                    if len(text) == 0 and len(images) >= 1:
+                        no_text_count += 1
+            finally:
                 doc.close()
-                return False
-
-            no_text_count = 0
-            for i in range(check_count):
-                page = doc[i]
-                text = page.get_text().strip()
-                images = page.get_images()
-                if len(text) == 0 and len(images) >= 1:
-                    no_text_count += 1
-
-            doc.close()
 
             # 如果所有采样页都无文字且有图片，则判定为扫描版
             is_scanned = (no_text_count == check_count) and (check_count > 0)
@@ -124,6 +151,7 @@ class PDFToWordConverter:
             (是否成功, 消息/错误信息)
         """
         import fitz
+        import shutil
         from docx import Document
         from docx.shared import Inches
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -172,19 +200,10 @@ class PDFToWordConverter:
 
                 logger.info(f"已处理第 {page_idx + 1}/{total_pages} 页")
 
-            doc.close()
-
             if self._is_cancelled:
                 return False, "转换被用户中断"
 
             word_doc.save(output_path)
-
-            # 清理临时目录
-            try:
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
-                pass
 
             if not os.path.exists(output_path):
                 return False, "转换完成但输出文件不存在"
@@ -194,16 +213,17 @@ class PDFToWordConverter:
             return True, f"成功转换到: {output_path}"
 
         except Exception as e:
-            doc.close()
-            # 清理临时目录
-            try:
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
-                pass
             error_msg = f"图片模式转换失败: {str(e)}"
             logger.error(f"错误详情:\n{traceback.format_exc()}")
             return False, error_msg
+
+        finally:
+            # 统一释放资源：取消/异常/正常路径都会执行
+            try:
+                doc.close()
+            except Exception:
+                pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     # ========== 扫描版PDF的OCR转换 ==========
 
@@ -243,6 +263,7 @@ class PDFToWordConverter:
                 pdf_path, output_path, start, end, progress_callback
             )
         import fitz
+        import shutil
         from docx import Document
         from docx.shared import Inches, Pt, Cm
         from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -257,7 +278,6 @@ class PDFToWordConverter:
         logger.info(f"扫描版PDF，使用OCR转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
 
         word_doc = Document()
-        ocr = self._get_ocr_engine()
 
         # 设置默认字体
         style = word_doc.styles['Normal']
@@ -303,21 +323,11 @@ class PDFToWordConverter:
                 except OSError:
                     pass
 
-            doc.close()
-
             if self._is_cancelled:
                 return False, "转换被用户中断"
 
             # 保存Word文档
             word_doc.save(output_path)
-            self._release_ocr_engine()
-
-            # 清理临时目录
-            try:
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
-            except Exception:
-                pass
 
             if not os.path.exists(output_path):
                 return False, "转换完成但输出文件不存在"
@@ -327,16 +337,21 @@ class PDFToWordConverter:
             return True, f"成功转换到: {output_path}"
 
         except MemoryError:
-            doc.close()
-            self._release_ocr_engine()
             return False, "内存不足，OCR转换需要较多内存，请尝试转换较少页数"
 
         except Exception as e:
-            doc.close()
-            self._release_ocr_engine()
             error_msg = f"OCR转换失败: {str(e)}"
             logger.error(f"错误详情:\n{traceback.format_exc()}")
             return False, error_msg
+
+        finally:
+            # 统一释放资源：取消/异常/正常路径都会执行
+            try:
+                doc.close()
+            except Exception:
+                pass
+            self._release_ocr_engine()
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _extract_illustrations(
         self, page, temp_dir: str, page_idx: int
@@ -653,31 +668,19 @@ class PDFToWordConverter:
                     pdf_path, output_path, start, end, progress_callback
                 )
 
-            # 普通PDF：使用pdf2docx转换
+            # 普通PDF：使用pdf2docx转换（在独立子进程中执行，隔离底层C库崩溃）
             logger.info(f"开始转换: {pdf_path}")
-            self.converter = Converter(pdf_path)
-
-            # 获取总页数
-            total_pages = len(self.converter.pages)
-            end = end or total_pages
-            logger.info(f"总页数: {total_pages}")
-
-            # 使用自定义参数转换（禁用多进程，避免EXE崩溃）
-            self.converter.convert(
-                output_path,
-                start=start,
-                end=end,
-                pages=None,
-                kwargs={
-                    'debug': False,
-                    'multi_processing': False,  # 禁用多进程，避免EXE崩溃
-                }
+            success, err_msg = self._run_pdf2docx_isolated(
+                pdf_path, output_path, start, end
             )
+            gc.collect()
 
-            # 关闭转换器并释放内存
-            self.converter.close()
-            self.converter = None
-            gc.collect()  # 强制垃圾回收
+            # 转换期间收到取消请求，丢弃结果
+            if self._is_cancelled:
+                return False, "转换被用户中断"
+
+            if not success:
+                return False, err_msg
 
             # 验证生成的文件
             if not os.path.exists(output_path):
@@ -760,6 +763,7 @@ class PDFToWordConverter:
             self._fix_anchor_drawings(body, doc)
             
             # ========== 第二步：处理inline类型的图片 ==========
+            # 直接收集待删图片的XML节点引用，避免与anchor图片的索引空间混淆
             shapes_to_remove = []
             
             for idx, shape in enumerate(doc.inline_shapes):
@@ -802,19 +806,19 @@ class PDFToWordConverter:
                         logger.info(f"分析图片 {idx} 时出错: {e}")
                     
                     if is_blank_image:
-                        shapes_to_remove.append(idx)
+                        shapes_to_remove.append(shape._inline)
                         continue
                     
                     max_reasonable_size = Inches(8)
                     if width_px > max_reasonable_size or height_px > max_reasonable_size:
-                        shapes_to_remove.append(idx)
+                        shapes_to_remove.append(shape._inline)
                         logger.info(f"图片 {idx}: 尺寸异常大，已删除")
                         continue
                     
                     if width_px > 0 and height_px > 0:
                         aspect_ratio = width_px / height_px
                         if aspect_ratio > 10 or aspect_ratio < 0.1:
-                            shapes_to_remove.append(idx)
+                            shapes_to_remove.append(shape._inline)
                             logger.info(f"图片 {idx}: 宽高比异常（{aspect_ratio:.2f}），可能是分隔线，已删除")
                             continue
                     
@@ -830,7 +834,7 @@ class PDFToWordConverter:
             
             if shapes_to_remove:
                 logger.info(f"发现 {len(shapes_to_remove)} 个问题inline图片，正在清理...")
-                self._remove_problematic_shapes(doc, shapes_to_remove)
+                self._remove_problematic_shapes(shapes_to_remove)
             
             doc.save(docx_path)
             
@@ -1017,41 +1021,73 @@ class PDFToWordConverter:
             # 分析出错时保守处理：不删除
             return False
     
-    def _remove_problematic_shapes(self, doc, indices_to_remove):
+    def _remove_problematic_shapes(self, inline_elements):
         """
-        从文档中删除指定索引的图片
+        从文档中删除指定的inline图片
         
-        注意：python-docx 不直接支持删除inline_shapes，
-        所以我们需要通过操作XML来实现
+        直接基于inline shape的XML节点删除其所在的w:drawing元素，
+        避免使用findall索引（会与anchor图片混在同一列表导致错位误删）
         """
         try:
-            from docx.oxml import parse_xml
             from docx.oxml.ns import qn
             
-            # 获取文档的body
-            body = doc.element.body
-            
-            # 找到所有的 drawing 元素（递归搜索嵌套元素）
-            drawings = body.findall('.//' + qn('w:drawing'))
-            
-            # 倒序删除，避免索引变化
-            for idx in sorted(indices_to_remove, reverse=True):
-                if idx < len(drawings):
-                    drawing = drawings[idx]
-                    # 获取父元素并删除
-                    parent = drawing.getparent()
-                    if parent is not None:
-                        parent.remove(drawing)
+            for inline_elem in inline_elements:
+                # inline 元素的父节点即 w:drawing
+                drawing = inline_elem.getparent()
+                if drawing is None or drawing.tag != qn('w:drawing'):
+                    continue
+                parent = drawing.getparent()
+                if parent is not None:
+                    parent.remove(drawing)
                         
         except Exception as e:
             logger.info(f"删除问题图片时出错: {e}")
     
+    def _run_pdf2docx_isolated(self, pdf_path, output_path, start, end):
+        """
+        在独立子进程中运行 pdf2docx 转换，隔离底层C库崩溃。
+
+        Returns:
+            (是否成功, 错误信息)
+        """
+        ctx = multiprocessing.get_context("spawn")
+        result_queue = ctx.Queue()
+        proc = ctx.Process(
+            target=_pdf2docx_worker,
+            args=(pdf_path, output_path, start, end, result_queue),
+        )
+        self._process = proc
+        proc.start()
+        proc.join()
+        self._process = None
+
+        # 被取消（子进程已被 terminate）
+        if self._is_cancelled:
+            return False, "转换被用户中断"
+
+        # 子进程异常退出（exitcode 非0/负值表示原生崩溃或被信号终止）
+        if proc.exitcode != 0:
+            logger.error(f"pdf2docx子进程异常退出: exitcode={proc.exitcode}")
+            return False, "该PDF触发底层解析库崩溃，无法转换（文档结构复杂或不兼容）"
+
+        # 读取子进程返回的结果
+        try:
+            return result_queue.get_nowait()
+        except Exception:
+            # 队列为空但进程正常退出，回退到检查输出文件
+            return os.path.exists(output_path), "转换结果未知"
+
     def cancel(self):
-        """取消转换"""
+        """
+        取消转换（协作式）
+
+        设置取消标志；若 pdf2docx 子进程正在运行则直接终止它。
+        禁止跨线程关闭主进程内的 C 层对象，避免数据竞争导致崩溃。
+        """
         self._is_cancelled = True
-        if self.converter:
+        proc = self._process
+        if proc is not None and proc.is_alive():
             try:
-                self.converter.close()
+                proc.terminate()
             except Exception:
                 pass
-            self.converter = None

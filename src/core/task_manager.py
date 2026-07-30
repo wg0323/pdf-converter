@@ -19,7 +19,10 @@ class TaskManager(QObject):
     queue_updated = pyqtSignal(int, int)   # pending_count, running_count
     
     # 最大并发任务数限制
-    MAX_CONCURRENT_TASKS = 3
+    # 注意：底层转换库 pdf2docx / PyMuPDF(fitz) / PaddleOCR 均非线程安全，
+    # 多个工作线程同时调用会触发C层崩溃（进程闪退）。因此串行执行，
+    # 任务按队列逐个转换，从根本上避免原生库的并发访问。
+    MAX_CONCURRENT_TASKS = 1
     
     def __init__(self):
         super().__init__()
@@ -34,8 +37,7 @@ class TaskManager(QObject):
         self,
         file_path: str,
         output_dir: Optional[str] = None,
-        custom_filename: Optional[str] = None,
-        output_type: str = "word"
+        custom_filename: Optional[str] = None
     ) -> str:
         """
         添加新任务到队列（不立即启动）
@@ -49,8 +51,7 @@ class TaskManager(QObject):
             task_id=task_id,
             file_path=file_path,
             output_dir=output_dir,
-            custom_filename=custom_filename,
-            output_type=output_type
+            custom_filename=custom_filename
         )
         
         self.tasks[task_id] = task
@@ -60,11 +61,6 @@ class TaskManager(QObject):
         self._update_queue_status()
         
         return task_id
-    
-    def update_task_filename(self, task_id: str, custom_filename: str):
-        """更新任务的自定义文件名"""
-        if task_id in self.tasks:
-            self.tasks[task_id].custom_filename = custom_filename
     
     def start_all_pending(self):
         """启动所有等待中的任务"""
@@ -104,6 +100,8 @@ class TaskManager(QObject):
         # 连接信号
         worker.progress_updated.connect(self._on_task_progress)
         worker.task_finished.connect(self._on_task_finished)
+        # 线程真正结束后再清理引用，避免运行中的QThread被GC销毁导致崩溃
+        worker.finished.connect(lambda tid=task_id: self._cleanup_worker(tid))
         
         # 保存并启动
         self.workers[task_id] = worker
@@ -111,6 +109,14 @@ class TaskManager(QObject):
         
         self.task_started.emit(task_id)
         worker.start()
+    
+    def _cleanup_worker(self, task_id: str):
+        """工作线程结束后的清理（由 finished 信号触发，此时线程已安全退出）"""
+        worker = self.workers.pop(task_id, None)
+        if worker is not None:
+            # 释放转换器对象
+            worker.word_converter = None
+            worker.deleteLater()
     
     def _on_task_progress(self, task_id: str, status_message: str):
         """任务进度回调"""
@@ -121,22 +127,6 @@ class TaskManager(QObject):
         if task_id in self.running_tasks:
             self.running_tasks.remove(task_id)
             self.completed_tasks.add(task_id)
-        
-        # 清理工作线程（修复内存泄漏）
-        if task_id in self.workers:
-            worker = self.workers[task_id]
-            # 清理转换器对象，释放内存
-            if hasattr(worker, 'word_converter') and worker.word_converter:
-                worker.word_converter = None
-            if hasattr(worker, 'markdown_converter') and worker.markdown_converter:
-                worker.markdown_converter = None
-            # 等待线程结束
-            worker.wait(2000)  # 增加等待时间
-            # 删除worker引用
-            del self.workers[task_id]
-            # 强制垃圾回收
-            import gc
-            gc.collect()
         
         self.task_finished.emit(task_id, success, message)
         self._update_queue_status()
@@ -162,17 +152,16 @@ class TaskManager(QObject):
             return True
         
         elif task_id in self.running_tasks and task_id in self.workers:
-            # 任务正在运行，需要取消工作线程
+            # 任务正在运行，通知工作线程协作式取消（不阻塞等待，
+            # 线程结束后由 finished 信号触发 _cleanup_worker 清理）
             worker = self.workers[task_id]
             worker.cancel()
-            worker.wait(2000)  # 等待2秒让线程结束
             
             if task_id in self.tasks:
                 self.tasks[task_id].cancel()
             
             self.running_tasks.remove(task_id)
             self.completed_tasks.add(task_id)
-            del self.workers[task_id]
             
             self.task_cancelled.emit(task_id)
             self._update_queue_status()
@@ -209,7 +198,7 @@ class TaskManager(QObject):
         return False
 
     def cancel_all_tasks(self):
-        """取消所有任务"""
+        """取消所有任务（不阻塞等待线程结束）"""
         self.is_running = False
         # 取消等待中的任务
         for task_id in self.pending_queue[:]:
@@ -218,15 +207,35 @@ class TaskManager(QObject):
                 self.tasks[task_id].cancel()
             self.task_cancelled.emit(task_id)
         
-        # 取消正在运行的任务
+        # 取消正在运行的任务（协作式，与 cancel_task 行为一致）
         for task_id in list(self.running_tasks):
             if task_id in self.workers:
-                worker = self.workers[task_id]
-                worker.cancel()
-                worker.wait(2000)  # 等待线程结束
+                self.workers[task_id].cancel()
+            if task_id in self.tasks:
+                self.tasks[task_id].cancel()
+            self.completed_tasks.add(task_id)
+            self.task_cancelled.emit(task_id)
 
         self.running_tasks.clear()
         self._update_queue_status()
+
+    def wait_all_workers(self, timeout_ms: int = 5000):
+        """
+        等待所有工作线程结束（仅供退出程序时调用）
+
+        必须在进程退出前确保线程结束，否则运行中的QThread
+        被销毁会导致崩溃。
+        """
+        for worker in list(self.workers.values()):
+            worker.wait(timeout_ms)
+    
+    def has_active_duplicate(self, file_path: str, output_dir: Optional[str]) -> bool:
+        """检查是否已存在相同源文件与输出目录的未完成任务（避免并发写同一输出文件）"""
+        for task in self.tasks.values():
+            if (task.file_path == file_path and task.output_dir == output_dir
+                    and task.status in (TaskStatus.PENDING, TaskStatus.RUNNING)):
+                return True
+        return False
     
     def get_task(self, task_id: str) -> Optional[TaskItem]:
         """获取任务信息"""
