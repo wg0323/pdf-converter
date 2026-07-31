@@ -1,11 +1,12 @@
 import os
 import gc
+import sys
 import logging
 import traceback
 import tempfile
 import multiprocessing
 from pathlib import Path
-from typing import Optional, List, Tuple, TYPE_CHECKING
+from typing import Optional, TYPE_CHECKING
 
 # pdf2docx 导入链很重（PyMuPDF/numpy/opencv），懒加载以免拖慢主程序启动
 if TYPE_CHECKING:
@@ -96,29 +97,96 @@ class PDFToWordConverter:
 
     # ========== OCR引擎管理 ==========
 
-    def _get_ocr_engine(self):
+    @staticmethod
+    def _find_ocr_addon() -> Optional[str]:
         """
-        获取PaddleOCR引擎实例（懒加载，首次使用时初始化）
+        查找 OCR 增强包目录（ocr_addon）
+
+        增强包内含 paddle/paddleocr 及其依赖与离线模型，单独分发，
+        用户解压到程序目录内即可启用 OCR。
+        打包环境找 exe 同级目录，开发环境找项目根目录。
 
         Returns:
-            PaddleOCR 实例，如果不可用则返回 None
+            增强包目录路径，不存在则返回 None
         """
+        if getattr(sys, 'frozen', False):
+            base_dir = os.path.dirname(sys.executable)
+        else:
+            base_dir = str(Path(__file__).resolve().parents[2])
+        addon_dir = os.path.join(base_dir, 'ocr_addon')
+        return addon_dir if os.path.isdir(addon_dir) else None
+
+    def _get_ocr_engine(self, log=None):
+        """
+        获取 PP-Structure 引擎实例（懒加载，首次使用时初始化）
+
+        PP-Structure = 版面分析 + OCR + 阅读顺序恢复，可直出分层可编辑的 Word。
+        优先使用 OCR 增强包（ocr_addon）中的依赖与离线模型。
+
+        Args:
+            log: 可选的界面日志回调（接收一个字符串），用于向用户透传启用/降级原因
+
+        Returns:
+            PPStructure 实例，如果不可用则返回 None
+        """
+        log = log or (lambda m: None)
         if self._ocr_engine is None:
             try:
-                from paddleocr import PaddleOCR
-                logger.info("正在初始化OCR引擎...")
-                self._ocr_engine = PaddleOCR(
-                    use_angle_cls=True,
+                # 增强包存在时注入 sys.path（打包产物未内置 paddle，由增强包提供）。
+                # 依赖放在 site-packages 子目录：paddle 启动时按路径名包含
+                # "site-packages" 定位原生库目录，否则在冻结环境回退到
+                # site.USER_SITE（为 None）而崩溃
+                addon_dir = self._find_ocr_addon()
+                if addon_dir is None:
+                    log("未找到 OCR 增强包（程序目录下缺少 ocr_addon 文件夹）")
+                    logger.info("未找到 OCR 增强包，扫描版PDF将使用图片模式转换")
+                    return None
+                if addon_dir:
+                    addon_site = os.path.join(addon_dir, 'site-packages')
+                    if os.path.isdir(addon_site) and addon_site not in sys.path:
+                        sys.path.insert(0, addon_site)
+                    # PyInstaller 冻结环境下 site.USER_SITE 为 None，而 paddle
+                    # 启动时会用它拼接原生库路径（不判空，直接 TypeError），
+                    # 指向增强包 site-packages 使其能定位 paddle/libs
+                    import site
+                    if getattr(site, 'USER_SITE', None) is None:
+                        site.USER_SITE = addon_site
+
+                from paddleocr import PPStructure
+                logger.info("正在初始化PP-Structure引擎...")
+                log("正在初始化 OCR 引擎（首次较慢）...")
+
+                # 优先使用增强包内的离线模型，避免首次使用时联网下载
+                model_kwargs = {}
+                if addon_dir:
+                    models_dir = os.path.join(addon_dir, 'models')
+                    for name, param in (
+                        ('det', 'det_model_dir'),
+                        ('rec', 'rec_model_dir'),
+                        ('layout', 'layout_model_dir'),
+                    ):
+                        model_dir = os.path.join(models_dir, name)
+                        if os.path.isdir(model_dir):
+                            model_kwargs[param] = model_dir
+
+                # table=False：表格模型与 paddlepaddle 2.6 存在加载兼容问题，
+                # 表格区域按图片处理；recovery=True 启用阅读顺序恢复
+                self._ocr_engine = PPStructure(
+                    recovery=True,
+                    table=False,
                     lang='ch',
-                    show_log=False
+                    show_log=False,
+                    **model_kwargs
                 )
-                logger.info("OCR引擎初始化完成")
-            except ImportError:
-                logger.info("PaddleOCR未安装，扫描版PDF将使用图片模式转换")
+                logger.info("PP-Structure引擎初始化完成")
+            except ImportError as e:
+                log(f"OCR 增强包不完整（缺少 paddle 依赖：{e}）")
+                logger.info(f"PaddleOCR不可用（{e}），扫描版PDF将使用图片模式转换")
                 logger.info("提示：安装 paddleocr 和 paddlepaddle 可启用OCR文字识别功能")
                 return None
             except Exception as e:
-                logger.info(f"OCR引擎初始化失败: {e}")
+                log(f"OCR 引擎初始化失败：{e}")
+                logger.info(f"PP-Structure引擎初始化失败: {e}")
                 logger.info("扫描版PDF将使用图片模式转换")
                 return None
         return self._ocr_engine
@@ -237,14 +305,14 @@ class PDFToWordConverter:
         output_path: str,
         start: int = 0,
         end: Optional[int] = None,
-        progress_callback=None
+        progress_callback=None,
+        log_callback=None
     ) -> tuple[bool, str]:
         """
-        使用OCR将扫描版PDF转换为Word文档
+        使用 PP-Structure 将扫描版PDF转换为Word文档
 
-        对每一页：提取图片 → OCR识别文字 → 分析是否含插图 → 写入Word
-        - 纯文字页：OCR文字以段落形式写入
-        - 含插图的页：插图保存为图片 + OCR文字
+        对每一页：渲染为图片 → 版面分析（标题/正文/图片等区域）→ OCR识别
+        → 阅读顺序恢复 → 官方 recovery 直出分层可编辑的 docx。
 
         如果PaddleOCR不可用，回退到图片模式（每页作为图片插入Word）。
 
@@ -254,90 +322,91 @@ class PDFToWordConverter:
             start: 起始页码（从0开始）
             end: 结束页码
             progress_callback: 进度回调函数
+            log_callback: 可选的界面日志回调（接收一个字符串）
 
         Returns:
             (是否成功, 消息/错误信息)
         """
-        ocr = self._get_ocr_engine()
+        log = log_callback or (lambda m: None)
+        engine = self._get_ocr_engine(log=log)
 
-        if ocr is None:
-            # OCR不可用，回退到图片模式
+        if engine is None:
+            # OCR不可用，回退到图片模式（降级原因已由 _get_ocr_engine 透传）
+            log("未启用 OCR，改用图片模式转换扫描版 PDF（输出为图片，无可编辑文字）")
             logger.info("OCR不可用，使用图片模式转换扫描版PDF")
             return self._convert_scanned_pdf_as_images(
                 pdf_path, output_path, start, end, progress_callback
             )
+        log("已启用 OCR 文字识别（PP-Structure），开始逐页识别...")
         import fitz
         import shutil
-        from docx import Document
-        from docx.shared import Inches, Pt, Cm
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-        from PIL import Image
-        import io
+        import numpy as np
+        import cv2
+        from paddleocr import save_structure_res
+        from paddleocr.ppstructure.recovery.recovery_to_doc import (
+            sorted_layout_boxes, convert_info_docx,
+        )
 
         doc = fitz.open(pdf_path)
         total_pages = len(doc)
         actual_end = min(end or total_pages, total_pages)
         pages_to_convert = actual_end - start
 
-        logger.info(f"扫描版PDF，使用OCR转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
+        logger.info(f"扫描版PDF，使用PP-Structure转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
 
-        word_doc = Document()
-
-        # 设置默认字体
-        style = word_doc.styles['Normal']
-        font = style.font
-        font.name = '宋体'
-        font.size = Pt(10.5)
-
-        # 临时目录保存提取的图片
-        temp_dir = tempfile.mkdtemp(prefix='pdf_ocr_')
+        # 中间产物（图片区域裁剪/docx）必须用 ASCII 临时目录：
+        # cv2.imwrite 在 Windows 上无法写入含中文的路径（静默失败）
+        temp_dir = tempfile.mkdtemp(prefix='pdf_ppstructure_')
+        doc_name = 'ppstructure_result'
+        zoom = 200 / 72  # 200 DPI
 
         try:
+            all_res = []
+            last_img = None
             for page_idx in range(start, actual_end):
                 if self._is_cancelled:
                     break
 
-                page = doc[page_idx]
                 current_page = page_idx - start + 1
-
                 if progress_callback:
                     progress_callback(current_page, pages_to_convert)
 
-                logger.info(f"OCR识别第 {page_idx + 1}/{total_pages} 页...")
+                logger.info(f"PP-Structure识别第 {page_idx + 1}/{total_pages} 页...")
 
-                # 提取页面图片用于OCR
-                pix = page.get_pixmap(dpi=200)
-                img_path = os.path.join(temp_dir, f'page_{page_idx}.png')
-                pix.save(img_path)
-
-                # OCR识别
-                ocr_result = ocr.ocr(img_path, cls=True)
-
-                # 分析页面中的插图（非整页的小图片）
-                illustrations = self._extract_illustrations(page, temp_dir, page_idx)
-
-                # 将OCR结果和插图写入Word
-                self._write_page_to_docx(
-                    word_doc, ocr_result, illustrations, page_idx
+                # 渲染页面为 BGR ndarray
+                pix = doc[page_idx].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                    pix.height, pix.width, pix.n
                 )
+                if pix.n == 4:
+                    img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+                else:
+                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-                # 清理临时图片
-                try:
-                    os.remove(img_path)
-                except OSError:
-                    pass
+                # 版面分析 + OCR；img_idx 用于多页结果在 docx 中分页
+                rel_idx = page_idx - start
+                result = engine(img, img_idx=rel_idx)
+                # 图片区域裁剪落盘，convert_info_docx 生成 docx 时需要读取
+                save_structure_res(result, temp_dir, doc_name, img_idx=rel_idx)
+                res = sorted_layout_boxes(result, img.shape[1])
+                all_res += res
+                last_img = img
 
             if self._is_cancelled:
                 return False, "转换被用户中断"
 
-            # 保存Word文档
-            word_doc.save(output_path)
+            if not all_res:
+                return False, "PP-Structure未识别出任何内容"
 
-            if not os.path.exists(output_path):
+            # 生成 docx（写到 ASCII 临时目录），再移动到用户目标路径
+            convert_info_docx(last_img, all_res, temp_dir, doc_name)
+            temp_docx = os.path.join(temp_dir, f'{doc_name}_ocr.docx')
+            if not os.path.exists(temp_docx):
                 return False, "转换完成但输出文件不存在"
+            shutil.move(temp_docx, output_path)
 
             file_size_kb = os.path.getsize(output_path) / 1024
-            logger.info(f"OCR转换完成，文件大小: {file_size_kb:.1f}KB")
+            logger.info(f"PP-Structure转换完成，文件大小: {file_size_kb:.1f}KB")
             return True, f"成功转换到: {output_path}"
 
         except MemoryError:
@@ -357,270 +426,6 @@ class PDFToWordConverter:
             self._release_ocr_engine()
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    def _extract_illustrations(
-        self, page, temp_dir: str, page_idx: int
-    ) -> List[dict]:
-        """
-        从PDF页面提取插图（非整页覆盖的小图片/图表）
-
-        判断逻辑：图片面积占页面面积的比例小于80%且图片尺寸合理，
-        则认为是插图而非整页扫描图。
-
-        Args:
-            page: fitz.Page 对象
-            temp_dir: 临时目录路径
-            page_idx: 页码索引
-
-        Returns:
-            插图信息列表 [{"path": str, "y_position": float, "width": float, "height": float}]
-        """
-        illustrations = []
-        page_rect = page.rect
-        page_area = page_rect.width * page_rect.height
-
-        images = page.get_images(full=True)
-        for img_idx, img_info in enumerate(images):
-            try:
-                xref = img_info[0]
-                # 获取图片在页面上的位置信息
-                img_rects = page.get_image_rects(xref)
-                if not img_rects:
-                    continue
-
-                img_rect = img_rects[0]
-                img_area = img_rect.width * img_rect.height
-
-                # 判断是否为整页扫描图（面积占比>80%的视为整页图，跳过）
-                area_ratio = img_area / page_area if page_area > 0 else 0
-                if area_ratio > 0.8:
-                    continue
-
-                # 提取图片数据
-                base_image = page.parent.extract_image(xref)
-                if not base_image:
-                    continue
-
-                img_bytes = base_image["image"]
-                img_ext = base_image["ext"]
-
-                # 过滤太小的图片（可能是图标、装饰等）
-                from PIL import Image as PILImage
-                import io
-                pil_img = PILImage.open(io.BytesIO(img_bytes))
-                img_width, img_height = pil_img.size
-                pil_img.close()
-
-                # 跳过太小的图片（宽或高小于50像素）
-                if img_width < 50 or img_height < 50:
-                    continue
-
-                # 保存插图
-                img_filename = f'illust_{page_idx}_{img_idx}.{img_ext}'
-                img_path = os.path.join(temp_dir, img_filename)
-                with open(img_path, 'wb') as f:
-                    f.write(img_bytes)
-
-                illustrations.append({
-                    "path": img_path,
-                    "y_position": img_rect.y0,
-                    "width_inches": min(img_rect.width / 72, 6.0),
-                    "height_inches": min(img_rect.height / 72, 8.0),
-                })
-
-            except Exception as e:
-                logger.info(f"提取插图时出错（页{page_idx + 1}, 图{img_idx}）: {e}")
-                continue
-
-        return illustrations
-
-    def _write_page_to_docx(
-        self,
-        word_doc,
-        ocr_result,
-        illustrations: List[dict],
-        page_idx: int
-    ):
-        """
-        将单页OCR结果和插图写入Word文档
-
-        按Y坐标排序，将文字和插图按正确顺序写入。
-
-        Args:
-            word_doc: python-docx Document 对象
-            ocr_result: PaddleOCR 识别结果
-            illustrations: 插图信息列表
-            page_idx: 页码索引
-        """
-        from docx.shared import Inches, Pt
-        from docx.enum.text import WD_ALIGN_PARAGRAPH
-
-        # 收集所有内容元素（文字行 + 插图），按Y坐标排序
-        content_elements = []
-
-        # 处理OCR文字结果
-        if ocr_result and ocr_result[0]:
-            for line in ocr_result[0]:
-                box = line[0]       # [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                text = line[1][0]   # 识别的文字
-                conf = line[1][1]   # 置信度
-
-                # 跳过低置信度结果
-                if conf < 0.5:
-                    continue
-
-                # 计算Y坐标（取顶部两点平均值）
-                y_top = (box[0][1] + box[1][1]) / 2
-                # 计算行高
-                y_bottom = (box[2][1] + box[3][1]) / 2
-                line_height = y_bottom - y_top
-
-                content_elements.append({
-                    "type": "text",
-                    "y_position": y_top,
-                    "text": text,
-                    "line_height": line_height,
-                    "box_width": box[1][0] - box[0][0],
-                })
-
-        # 添加插图
-        for illust in illustrations:
-            content_elements.append({
-                "type": "image",
-                "y_position": illust["y_position"],
-                "path": illust["path"],
-                "width_inches": illust["width_inches"],
-                "height_inches": illust["height_inches"],
-            })
-
-        # 按Y坐标排序
-        content_elements.sort(key=lambda e: e["y_position"])
-
-        # 段落合并：相邻且Y坐标接近的文字行合并为同一段落
-        merged_paragraphs = self._merge_text_lines(content_elements)
-
-        # 写入Word
-        if page_idx > 0:
-            # 非首页添加分页符
-            word_doc.add_page_break()
-
-        for elem in merged_paragraphs:
-            if elem["type"] == "text":
-                para = word_doc.add_paragraph()
-                text = elem["text"]
-                # 根据行特征判断是否为标题
-                if self._is_heading(text, elem.get("line_height", 0)):
-                    run = para.add_run(text)
-                    run.bold = True
-                    run.font.size = Pt(14)
-                else:
-                    run = para.add_run(text)
-                    run.font.size = Pt(10.5)
-
-            elif elem["type"] == "image":
-                try:
-                    para = word_doc.add_paragraph()
-                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    run = para.add_run()
-                    width = min(elem["width_inches"], 5.5)
-                    run.add_picture(elem["path"], width=Inches(width))
-                except Exception as e:
-                    logger.info(f"插入插图时出错: {e}")
-
-    def _merge_text_lines(
-        self, content_elements: List[dict]
-    ) -> List[dict]:
-        """
-        将OCR识别的文字行合并为段落
-
-        合并规则：相邻的文字元素如果Y间距小于行高的1.5倍，则合并为同一段落。
-        图片元素不参与合并，保持独立。
-
-        Args:
-            content_elements: 按Y坐标排序的内容元素列表
-
-        Returns:
-            合并后的内容元素列表
-        """
-        if not content_elements:
-            return []
-
-        merged = []
-        current_text = None
-        current_y = 0
-        current_line_height = 0
-
-        for elem in content_elements:
-            if elem["type"] == "image":
-                # 图片前先保存当前累积的文字段落
-                if current_text is not None:
-                    merged.append({
-                        "type": "text",
-                        "text": current_text,
-                        "y_position": current_y,
-                        "line_height": current_line_height,
-                    })
-                    current_text = None
-                # 图片直接加入
-                merged.append(elem)
-                continue
-
-            # 文字元素
-            if current_text is None:
-                current_text = elem["text"]
-                current_y = elem["y_position"]
-                current_line_height = elem.get("line_height", 20)
-            else:
-                # 判断是否与上一行属于同一段落
-                y_gap = elem["y_position"] - current_y
-                threshold = current_line_height * 1.5
-                if y_gap < threshold:
-                    # 同一段落，追加文字
-                    current_text += elem["text"]
-                else:
-                    # 不同段落，先保存当前段落
-                    merged.append({
-                        "type": "text",
-                        "text": current_text,
-                        "y_position": current_y,
-                        "line_height": current_line_height,
-                    })
-                    current_text = elem["text"]
-                    current_y = elem["y_position"]
-                    current_line_height = elem.get("line_height", 20)
-
-        # 保存最后一个段落
-        if current_text is not None:
-            merged.append({
-                "type": "text",
-                "text": current_text,
-                "y_position": current_y,
-                "line_height": current_line_height,
-            })
-
-        return merged
-
-    def _is_heading(self, text: str, line_height: float) -> bool:
-        """
-        根据文字内容和行高判断是否为标题
-
-        Args:
-            text: 文字内容
-            line_height: 行高
-
-        Returns:
-            True 表示可能是标题
-        """
-        # 行高较大时可能是标题
-        if line_height > 35:
-            return True
-        # 较短的文字行可能是标题
-        stripped = text.strip()
-        if len(stripped) <= 30 and not stripped.endswith(('。', '，', '；', '、', '：')):
-            # 以"第X章"或"第X节"开头的通常是标题
-            if stripped.startswith(('第', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9')):
-                return True
-        return False
-
     # ========== 主转换入口 ==========
 
     def convert(
@@ -629,7 +434,8 @@ class PDFToWordConverter:
         output_path: str,
         start: int = 0,
         end: Optional[int] = None,
-        progress_callback=None
+        progress_callback=None,
+        log_callback=None
     ) -> tuple[bool, str]:
         """
         将PDF转换为Word文档
@@ -644,10 +450,12 @@ class PDFToWordConverter:
             start: 起始页码（从0开始）
             end: 结束页码（None表示到最后一页）
             progress_callback: 进度回调函数(page_no, total_pages)
+            log_callback: 可选的界面日志回调（接收一个字符串），用于透传扫描版检测/OCR状态
 
         Returns:
             (是否成功, 消息/错误信息)
         """
+        log = log_callback or (lambda m: None)
         try:
             self._is_cancelled = False
 
@@ -668,8 +476,9 @@ class PDFToWordConverter:
 
             if is_scanned:
                 # 扫描版PDF：使用OCR转换
+                log("检测到扫描版 PDF（页面无可提取文字层）")
                 return self._convert_scanned_pdf(
-                    pdf_path, output_path, start, end, progress_callback
+                    pdf_path, output_path, start, end, progress_callback, log
                 )
 
             # 普通PDF：使用pdf2docx转换（在独立子进程中执行，隔离底层C库崩溃）

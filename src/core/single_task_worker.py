@@ -11,6 +11,7 @@ class SingleTaskWorker(QThread):
     # 信号
     progress_updated = pyqtSignal(str, str)  # task_id, status_message
     task_finished = pyqtSignal(str, bool, str)  # task_id, success, message
+    log_message = pyqtSignal(str, str)  # task_id, 面向用户的日志文本
     
     def __init__(self, task: TaskItem):
         super().__init__()
@@ -42,7 +43,8 @@ class SingleTaskWorker(QThread):
         output_word = self.task.get_output_path(".docx")
         success, msg = self.word_converter.convert(
             self.task.file_path,
-            output_word
+            output_word,
+            log_callback=lambda m: self.log_message.emit(self.task.task_id, m)
         )
         # 被取消的任务状态由 TaskManager 维护，此处不再覆盖、不再发完成信号
         if self._is_cancelled:

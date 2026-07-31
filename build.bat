@@ -40,7 +40,8 @@ echo [3/5] Preparing build directories...
 if /i "%~1"=="full" (
     if exist "build" rmdir /s /q "build"
 )
-if exist "dist" rmdir /s /q "dist"
+REM Only remove the app folder: dist\ocr_addon (built separately) must survive
+if exist "dist\PDFConverter" rmdir /s /q "dist\PDFConverter"
 echo [OK] Ready
 
 REM Run PyInstaller (--clean only in full mode, incremental cache speeds up rebuilds)
@@ -77,6 +78,20 @@ if exist "dist\PDFConverter\PDFConverter.exe" (
     REM Get file size
     for %%I in ("dist\PDFConverter\PDFConverter.exe") do (
         echo Launcher size: %%~zI bytes
+    )
+    
+    REM Auto-include the OCR addon if it was built (project-root ocr_addon\).
+    REM Kept outside dist so the deliverable dist\PDFConverter is the only
+    REM folder in dist; build.bat recreates dist\PDFConverter each run, so we
+    REM restore the OCR copy here from the persistent project-root cache.
+    echo.
+    if exist "ocr_addon" (
+        echo Including OCR addon into dist\PDFConverter\ocr_addon ...
+        xcopy /e /i /q /y "ocr_addon" "dist\PDFConverter\ocr_addon" >nul
+        echo [OK] OCR addon included ^(scanned PDFs will use PP-Structure OCR^)
+    ) else (
+        echo NOTE: ocr_addon not found - scanned PDFs will use image mode.
+        echo       Run build_ocr_addon.bat once to build the OCR addon.
     )
     
     echo.

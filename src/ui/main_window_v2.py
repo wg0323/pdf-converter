@@ -69,6 +69,7 @@ class MainWindow(QMainWindow):
         self.task_manager.task_cancelled.connect(self.on_task_cancelled)
         self.task_manager.all_tasks_finished.connect(self.on_all_tasks_finished)
         self.task_manager.queue_updated.connect(self.on_queue_updated)
+        self.task_manager.task_log.connect(self.on_task_log)
     
     def init_ui(self):
         self.setWindowTitle('PDF转换器 v4.0')
@@ -402,6 +403,12 @@ class MainWindow(QMainWindow):
     def on_task_progress(self, task_id: str, message: str):
         """任务进度回调"""
         self.update_task_row(task_id)
+    
+    def on_task_log(self, task_id: str, message: str):
+        """任务日志回调：将扫描版检测/OCR 启用或降级原因透传到转换日志"""
+        task = self.task_manager.get_task(task_id)
+        prefix = f'{task.file_name}: ' if task else ''
+        self.add_log(f'{prefix}{message}')
     
     def on_task_finished(self, task_id: str, success: bool, message: str):
         """任务完成回调"""

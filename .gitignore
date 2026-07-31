@@ -1,6 +1,7 @@
 # Build output
 build/
 dist/
+dist_test/
 
 # Test output
 tests/
@@ -42,3 +43,6 @@ crash_log.txt
 # 输入/测试用 PDF 文件（不纳入版本库）
 *.pdf
 /docs
+
+# OCR 增强包持久缓存（约 790MB，由 build_ocr_addon.bat 生成，不入库）
+/ocr_addon

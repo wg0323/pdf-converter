@@ -15,6 +15,7 @@ class TaskManager(QObject):
     task_progress = pyqtSignal(str, str)   # task_id, status_message
     task_finished = pyqtSignal(str, bool, str)  # task_id, success, message
     task_cancelled = pyqtSignal(str)       # task_id
+    task_log = pyqtSignal(str, str)        # task_id, 面向用户的日志文本
     all_tasks_finished = pyqtSignal()      # 所有任务完成
     queue_updated = pyqtSignal(int, int)   # pending_count, running_count
     
@@ -100,6 +101,7 @@ class TaskManager(QObject):
         # 连接信号
         worker.progress_updated.connect(self._on_task_progress)
         worker.task_finished.connect(self._on_task_finished)
+        worker.log_message.connect(self._on_task_log)
         # 线程真正结束后再清理引用，避免运行中的QThread被GC销毁导致崩溃
         worker.finished.connect(lambda tid=task_id: self._cleanup_worker(tid))
         
@@ -124,6 +126,10 @@ class TaskManager(QObject):
     def _on_task_progress(self, task_id: str, status_message: str):
         """任务进度回调"""
         self.task_progress.emit(task_id, status_message)
+    
+    def _on_task_log(self, task_id: str, message: str):
+        """任务日志回调（透传扫描版检测/OCR状态至界面）"""
+        self.task_log.emit(task_id, message)
     
     def _on_task_finished(self, task_id: str, success: bool, message: str):
         """任务完成回调"""
