@@ -659,11 +659,11 @@ class PDFToWordConverter:
         处理anchor类型的浮动图片
 
         pdf2docx 会将PDF中的背景图层转为anchor类型的浮动图片（behindDoc=1），
-        这些图片包括水印、页眉页脚装饰线、整页白色背景层等，会遮挡正常内容。
+        这些背景层里往往包含页面上的图表/截图，不能误删。
 
         处理策略：
-        1. behindDoc=1 且内容为水印/背景 → 删除
-        2. behindDoc=1 且有实质内容 → 改为 behindDoc=0
+        1. behindDoc=1 且有实质内容 → 保留（保持 behindDoc=1，作为正文背景）
+        2. behindDoc=1 且为完全透明的占位图 → 删除
         3. 尺寸异常的巨型图片 → 删除
         """
         try:
@@ -674,9 +674,23 @@ class PDFToWordConverter:
             ns_a = 'http://schemas.openxmlformats.org/drawingml/2006/main'
             ns_r = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
 
-            # 异常巨型图片阈值（正常页面最大尺寸）
-            max_reasonable_width_emu = int(Inches(20))
-            max_reasonable_height_emu = int(Inches(30))
+            # 异常巨型图片阈值：pdf2docx 会把整页背景渲染为接近页面尺寸的
+            # behindDoc 图片，阈值过小会把这些正常背景图误删，所以放宽到
+            # 明显超出常规页面很多的尺寸（Word 仍可正常打开）。
+            max_reasonable_width_emu = int(Inches(40))
+            max_reasonable_height_emu = int(Inches(60))
+
+            # 页面尺寸，用于把页背景图缩放到 Word 页面大小
+            try:
+                page_width_emu = int(doc.sections[0].page_width)
+                page_height_emu = int(doc.sections[0].page_height)
+            except Exception:
+                page_width_emu = int(Inches(8.27))
+                page_height_emu = int(Inches(11.69))
+
+            # 判断页面背景图的尺寸下限（大于此尺寸才认为是整页背景）
+            min_page_width_emu = int(Inches(10))
+            min_page_height_emu = int(Inches(10))
 
             # 查找所有 drawing 元素（使用 .// 递归搜索嵌套元素）
             drawings = body.findall('.//' + qn('w:drawing'))
@@ -721,17 +735,25 @@ class PDFToWordConverter:
                         logger.info(f"删除异常巨型浮动图片: {cx_inches:.1f}x{cy_inches:.1f} 英寸, behindDoc={behind_doc}")
                         should_remove = True
                     elif is_behind_doc:
-                        # behindDoc=1的浮动图片需要分析内容，判断是水印还是有用图片
-                        is_watermark = self._is_watermark_image(drawing, doc, ns_a, ns_r)
-                        if is_watermark:
+                        # behindDoc=1 的图片通常是 pdf2docx 生成的页面背景层，
+                        # 里面往往包含正文图表，不能按水印逻辑误删。
+                        # 只删除完全透明或极小的占位图，其余保留在文字下方。
+                        is_empty = self._is_transparent_image(drawing, doc, ns_a, ns_r)
+                        if is_empty:
                             width_inches = cx / 914400
                             height_inches = cy / 914400
-                            logger.info(f"删除背景浮动图片(水印): {width_inches:.1f}x{height_inches:.1f} 英寸")
+                            logger.info(f"删除透明/占位背景图片: {width_inches:.1f}x{height_inches:.1f} 英寸")
                             should_remove = True
                             behind_removed_count += 1
                         else:
-                            # 有实质内容的behindDoc图片：改为behindDoc=0使其正常显示
-                            anchor.set('behindDoc', '0')
+                            # 有实质内容的 behindDoc 图片作为正文背景保留，
+                            # 保持 behindDoc=1 以免遮挡已提取的可编辑文字。
+                            # 若它是接近页面尺寸的整页背景，则缩放到 Word 页面大小，
+                            # 避免原图 20+ 英寸导致显示不全/只显示左上角。
+                            if (cx >= min_page_width_emu and cy >= min_page_height_emu):
+                                self._scale_anchor_to_page(
+                                    anchor, page_width_emu, page_height_emu, ns_wp
+                                )
                             behind_preserved_count += 1
 
                     if should_remove:
@@ -752,23 +774,76 @@ class PDFToWordConverter:
         except Exception as e:
             logger.info(f"修复浮动图片时出错: {e}")
 
-    def _is_watermark_image(self, drawing, doc, ns_a, ns_r):
+    def _scale_anchor_to_page(self, anchor, page_width_emu, page_height_emu, ns_wp):
         """
-        判断behindDoc浮动图片是否为水印/背景
-        
-        通过分析图片内容来判断：
-        - 极小文件（<1KB）：装饰线，是水印
-        - 纯色/几乎无内容图片：背景层，是水印
-        - 有实质内容（深色/中等亮度像素占比高）：不是水印，应保留
-        
+        把整页背景 anchor 缩放到 Word 页面大小，并重置定位到页面左上角
+
+        pdf2docx 生成的页背景图通常被渲染成 20+ 英寸的巨型 anchor，并带
+        有负的 positionOffset，Word 默认只显示左上角一部分。将其缩放到真实
+        页面尺寸并定位到 (0,0) 可保证整页内容可见且比例正确。
+        """
+        try:
+            from docx.oxml.ns import qn
+
+            # 保持 behindDoc=1，确保图片在文字下方
+            anchor.set('behindDoc', '1')
+
+            # 修改 anchor 外层 extent
+            extent = anchor.find(qn('wp:extent'))
+            if extent is None:
+                extent = anchor.find('{' + ns_wp + '}extent')
+            if extent is not None:
+                extent.set('cx', str(page_width_emu))
+                extent.set('cy', str(page_height_emu))
+
+            # 重置 position 偏移为 0
+            for pos_tag in ('positionH', 'positionV'):
+                pos = anchor.find(qn('wp:' + pos_tag))
+                if pos is None:
+                    pos = anchor.find('{' + ns_wp + '}' + pos_tag)
+                if pos is not None:
+                    off = pos.find(qn('wp:posOffset'))
+                    if off is None:
+                        off = pos.find('{' + ns_wp + '}posOffset')
+                    if off is not None:
+                        off.text = '0'
+
+            # simplePos 也归零
+            simple_pos = anchor.find(qn('wp:simplePos'))
+            if simple_pos is None:
+                simple_pos = anchor.find('{' + ns_wp + '}simplePos')
+            if simple_pos is not None:
+                simple_pos.set('x', '0')
+                simple_pos.set('y', '0')
+
+            # 同步修改内层图形的 extent/off，避免内层尺寸与外层不匹配导致裁剪
+            ns_a = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+            for ext in anchor.findall('.//' + qn('a:ext')):
+                ext.set('cx', str(page_width_emu))
+                ext.set('cy', str(page_height_emu))
+            for off in anchor.findall('.//' + qn('a:off')):
+                off.set('x', '0')
+                off.set('y', '0')
+
+        except Exception as e:
+            logger.info(f"缩放页背景图时出错: {e}")
+
+    def _is_transparent_image(self, drawing, doc, ns_a, ns_r):
+        """
+        判断 behindDoc 背景图片是否为完全透明的占位图
+
+        pdf2docx 在某些文档里会生成大量全透明的背景层（例如 RGBA
+        图片但 alpha 通道全为 0）。这类图片没有可见内容，可以安全删除，
+        避免在 Word 中产生冗余的浮动对象。
+
         Args:
             drawing: XML drawing 元素
             doc: Document 对象，用于获取图片数据
             ns_a: drawingml 主命名空间
             ns_r: 关系命名空间
-            
+
         Returns:
-            True 表示是水印应删除，False 表示有内容应保留
+            True 表示是完全透明的占位图，应删除；False 保留
         """
         try:
             from docx.oxml.ns import qn
@@ -781,7 +856,6 @@ class PDFToWordConverter:
                 blip = drawing.find('.//{' + ns_a + '}blip')
 
             if blip is None:
-                # 无图片数据，视为水印
                 return True
 
             embed = blip.get(qn('r:embed'))
@@ -789,7 +863,6 @@ class PDFToWordConverter:
                 embed = blip.get('{' + ns_r + '}embed')
 
             if not embed or doc is None:
-                # 无法获取图片，保守处理：不删除
                 return False
 
             image_part = doc.part.related_parts.get(embed)
@@ -797,41 +870,23 @@ class PDFToWordConverter:
                 return False
 
             blob_size = len(image_part.blob)
-
-            # 极小文件（<1KB），通常是装饰线/占位符
             if blob_size < 1000:
                 return True
 
-            # 分析图片像素内容
             img = Image.open(io.BytesIO(image_part.blob))
-            img_rgb = img.convert('RGB')
+            if img.mode == 'RGBA':
+                alpha = img.split()[-1]
+                # 如果 alpha 最大值极低，认为完全透明
+                if alpha.getextrema()[1] < 10:
+                    img.close()
+                    alpha.close()
+                    return True
+                alpha.close()
 
-            # 缩略图分析：缩小到100x100后遍历，避免逐像素getpixel
-            small_img = img_rgb.resize((100, 100), Image.LANCZOS)
-            pixels = list(small_img.getdata())
-            small_img.close()
             img.close()
-            img_rgb.close()
-
-            total_samples = len(pixels)
-            dark_pixels = sum(1 for p in pixels if (p[0] + p[1] + p[2]) / 3 < 128)
-            mid_pixels = sum(1 for p in pixels if 128 <= (p[0] + p[1] + p[2]) / 3 < 220)
-
-            if total_samples == 0:
-                return True
-
-            dark_ratio = dark_pixels / total_samples
-            mid_ratio = mid_pixels / total_samples
-
-            # 判断逻辑：
-            # 深色像素 >= 3% 或中等亮度像素 >= 10% → 有实质内容，不是水印
-            # 否则 → 纯背景/水印
-            is_watermark = dark_ratio < 0.03 and mid_ratio < 0.10
-
-            return is_watermark
+            return False
 
         except Exception:
-            # 分析出错时保守处理：不删除
             return False
     
     def _remove_problematic_shapes(self, inline_elements):
