@@ -1,13 +1,13 @@
 # PDF转换器（PDF Converter）
 
-一款基于 PyQt6 的 Windows 桌面应用，将 PDF 文件批量转换为 Word（.docx）文档。支持普通 PDF 与扫描版 PDF，扫描版可通过 PaddleOCR 识别文字（未安装 OCR 时自动降级为图片模式）。
+一款基于 PyQt6 的 Windows 桌面应用，将 PDF 文件批量转换为 Word（.docx）文档。支持普通 PDF 与扫描版 PDF：普通 PDF 保留排版与图片，扫描版在 `ocr_addon` 增强包存在时通过 PP-Structure OCR 直出分层可编辑 Word，否则自动降级为整页图片模式。
 
 ## 功能特点
 
 - **PDF 转 Word**：普通 PDF 使用 pdf2docx 转换，保留排版与图片
 - **扫描版 PDF 支持**：自动检测扫描版，用 PP-Structure 版面分析 + OCR 直出分层可编辑 Word（可选 PaddleOCR），不可用时降级为整页图片模式
 - **任务队列管理**：最多 20 个任务排队，串行逐个转换（底层库非线程安全，串行以保证稳定）
-- **智能图片修复**：自动清理转换产物中的水印、异常浮动图片、空白装饰图
+- **图片保留与修复**：保留 pdf2docx 生成的页面背景图并自动缩放到 Word 页面尺寸，避免图片显示不全/比例异常/与文字重叠；同时清理透明占位图与异常巨型浮动图
 - **防覆盖保护**：输出文件同名时自动追加序号；重复任务自动去重
 - **拖拽添加**：支持将 PDF 文件直接拖入窗口
 - **协作式取消**：转换中可安全取消任务，退出时等待线程结束
@@ -42,8 +42,10 @@ pdf-converter/
 │       └── styles/              # 界面样式
 ├── resources/icons/             # 应用图标资源
 ├── tests/                       # 功能测试
+├── ocr_addon/                   # OCR 增强包缓存（由 build_ocr_addon.bat 生成，gitignored）
 ├── PDFConverter.spec            # PyInstaller 打包配置
-├── build.bat                    # 一键打包脚本
+├── build.bat                    # 一键打包脚本（自动内含 ocr_addon）
+├── build_ocr_addon.bat          # 构建 OCR 增强包脚本
 └── requirements.txt             # 依赖清单
 ```
 
@@ -57,19 +59,25 @@ pip install -r requirements.txt
 python src/main.py
 ```
 
-> 提示：PaddleOCR 为可选依赖，未安装时扫描版 PDF 将以图片模式转换。
+> 提示：开发环境下 PaddleOCR 为可选依赖，未安装时扫描版 PDF 将以图片模式转换。打包版本中扫描版 OCR 由 exe 同级的 `ocr_addon` 文件夹提供。
 
 ## 打包
 
 ```bash
-build.bat            # 快速增量打包（保留缓存，日常使用）
+build_ocr_addon.bat  # 构建 OCR 增强包（可选，首次需要；生成项目根 ocr_addon/，约 790MB）
+build.bat            # 快速增量打包（保留缓存，自动内含已生成的 ocr_addon）
 build.bat full       # 完整打包（安装依赖 + 清理缓存重新分析）
-build_ocr_addon.bat  # 构建 OCR 增强包（可选，输出 dist\ocr_addon）
 ```
 
 产物输出至 `dist\PDFConverter\` 目录（目录模式，启动无需自解压），分发时打包整个文件夹，双击其中 `PDFConverter.exe` 运行。
 
-**OCR 增强包**：主安装包不含 PaddleOCR，扫描版 PDF 默认以图片模式转换。需要 OCR 文字识别时，将 `dist\ocr_addon` 文件夹（含 paddle 依赖与离线模型，约 790MB）单独打 zip 分发，用户解压到 `PDFConverter` 文件夹内（与 exe 同级）即自动启用 PP-Structure OCR，无需联网下载模型。
+**OCR 增强包说明**：
+
+- `ocr_addon` 是可选增强包，内含 `paddle/paddleocr` 依赖与中文离线模型，用于把扫描版 PDF 转换为可编辑文字。
+- 运行 `build_ocr_addon.bat` 会在项目根生成 `ocr_addon/`（持久缓存，已加入 `.gitignore`，不进入版本库）。
+- 运行 `build.bat` 或 `build.bat full` 时，会自动把项目根的 `ocr_addon` 复制到 `dist\PDFConverter\ocr_addon`。
+- 因此最终交付物就是完整的 `dist\PDFConverter` 文件夹：内部已经包含 OCR 增强包，无需用户手动解压。
+- 如果没有构建 `ocr_addon`，`build.bat` 也能完成打包，但会提示“ocr_addon not found”，此时扫描版 PDF 自动降级为整页图片模式。
 
 ## 测试
 
@@ -83,9 +91,10 @@ python tests/test_conversion.py
 
 ### 已完成
 
+- [x] 修复普通 PDF 图片丢失/显示不全/图文重叠（2026-08）：pdf2docx 生成的整页背景图被误删或保持 20+ 英寸导致只显示左上角，现在保留并缩放到 Word 页面尺寸、定位到页面左上角，保持 behindDoc=1 置于文字下方
 - [x] PDF 转 Word 核心功能（普通 / 扫描版自动识别）
 - [x] 任务队列调度（20 任务上限、串行执行）
-- [x] Word 文档图片修复（水印清理、异常浮动图处理、空白图删除）
+- [x] Word 文档图片修复（水印清理、异常浮动图处理、透明占位图删除、整页背景图缩放对齐）
 - [x] Element Plus 风格 UI、拖拽添加、任务智能排序
 - [x] PyInstaller 打包（目录模式）
 - [x] 代码审查改进（2026-07）：
