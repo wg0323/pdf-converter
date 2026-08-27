@@ -236,7 +236,12 @@ class TaskManager(QObject):
         被销毁会导致崩溃。
         """
         for worker in list(self.workers.values()):
-            worker.wait(timeout_ms)
+            if not worker.wait(timeout_ms):
+                # 协作式取消未在超时内生效（如 OCR 单页推理耗时较长），
+                # 强制终止线程兑底，避免仍在运行的 QThread 被销毁
+                # 触发 Qt 致命崩溃（qFatal）
+                worker.terminate()
+                worker.wait(2000)
     
     def has_active_duplicate(self, file_path: str, output_dir: Optional[str]) -> bool:
         """检查是否已存在相同源文件与输出目录的未完成任务（避免并发写同一输出文件）"""

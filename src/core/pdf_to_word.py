@@ -2,6 +2,7 @@ import os
 import gc
 import sys
 import logging
+import queue
 import traceback
 import tempfile
 import multiprocessing
@@ -228,18 +229,21 @@ class PDFToWordConverter:
         from docx.shared import Inches
         from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-        doc = fitz.open(pdf_path)
-        total_pages = len(doc)
-        actual_end = min(end or total_pages, total_pages)
-        pages_to_convert = actual_end - start
-
-        logger.info(f"图片模式转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
-
-        word_doc = Document()
-
-        temp_dir = tempfile.mkdtemp(prefix='pdf_img_')
+        doc = None
+        temp_dir = None
 
         try:
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+            actual_end = min(end if end is not None else total_pages, total_pages)
+            pages_to_convert = actual_end - start
+
+            logger.info(f"图片模式转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
+
+            word_doc = Document()
+
+            temp_dir = tempfile.mkdtemp(prefix='pdf_img_')
+
             for page_idx in range(start, actual_end):
                 if self._is_cancelled:
                     break
@@ -291,11 +295,13 @@ class PDFToWordConverter:
 
         finally:
             # 统一释放资源：取消/异常/正常路径都会执行
-            try:
-                doc.close()
-            except Exception:
-                pass
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     # ========== 扫描版PDF的OCR转换 ==========
 
@@ -347,20 +353,23 @@ class PDFToWordConverter:
             sorted_layout_boxes, convert_info_docx,
         )
 
-        doc = fitz.open(pdf_path)
-        total_pages = len(doc)
-        actual_end = min(end or total_pages, total_pages)
-        pages_to_convert = actual_end - start
-
-        logger.info(f"扫描版PDF，使用PP-Structure转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
-
-        # 中间产物（图片区域裁剪/docx）必须用 ASCII 临时目录：
-        # cv2.imwrite 在 Windows 上无法写入含中文的路径（静默失败）
-        temp_dir = tempfile.mkdtemp(prefix='pdf_ppstructure_')
+        doc = None
+        temp_dir = None
         doc_name = 'ppstructure_result'
         zoom = 200 / 72  # 200 DPI
 
         try:
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+            actual_end = min(end if end is not None else total_pages, total_pages)
+            pages_to_convert = actual_end - start
+
+            logger.info(f"扫描版PDF，使用PP-Structure转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
+
+            # 中间产物（图片区域裁剪/docx）必须用 ASCII 临时目录：
+            # cv2.imwrite 在 Windows 上无法写入含中文的路径（静默失败）
+            temp_dir = tempfile.mkdtemp(prefix='pdf_ppstructure_')
+
             all_res = []
             last_img = None
             for page_idx in range(start, actual_end):
@@ -419,12 +428,14 @@ class PDFToWordConverter:
 
         finally:
             # 统一释放资源：取消/异常/正常路径都会执行
-            try:
-                doc.close()
-            except Exception:
-                pass
+            if doc is not None:
+                try:
+                    doc.close()
+                except Exception:
+                    pass
             self._release_ocr_engine()
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     # ========== 主转换入口 ==========
 
@@ -457,7 +468,11 @@ class PDFToWordConverter:
         """
         log = log_callback or (lambda m: None)
         try:
-            self._is_cancelled = False
+            # 已收到取消请求则直接退出；不再重置标志，
+            # 避免覆盖掉转换启动前到达的取消请求
+            # （每个任务使用独立的转换器实例，无需重置）
+            if self._is_cancelled:
+                return False, "转换已被用户取消"
 
             if not os.path.exists(pdf_path):
                 return False, f"PDF文件不存在: {pdf_path}"
@@ -941,7 +956,7 @@ class PDFToWordConverter:
         # 读取子进程返回的结果
         try:
             return result_queue.get_nowait()
-        except Exception:
+        except queue.Empty:
             # 队列为空但进程正常退出，回退到检查输出文件
             return os.path.exists(output_path), "转换结果未知"
 
