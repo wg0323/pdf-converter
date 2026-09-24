@@ -116,3 +116,10 @@ python tests/test_conversion.py
 - [x] 转换日志透传 OCR 状态（2026-07）：扫描版检测、OCR 启用、降级原因（未找到增强包/依赖缺失/初始化失败）新增专用日志通道（converter log_callback → worker.log_message → task_manager.task_log → 界面转换日志），用户可直接看到扫描版为何输出图片而非文字
 - [x] build.bat 自动内含 OCR 增强包（2026-07）：因 build.bat 每次重建会重建 dist\PDFConverter 导致内部 ocr_addon 副本丢失，构建成功后自动检测项目根 ocr_addon 并复制回 dist\PDFConverter\ocr_addon（不存在时提示跑 build_ocr_addon.bat），一条命令即得到带 OCR 的完整包
 - [x] OCR 增强包缓存移出 dist（2026-07）：build_ocr_addon.bat 输出从 dist\ocr_addon 改为项目根 ocr_addon（持久缓存、已 gitignore），dist 目录下只保留唯一交付物 dist\PDFConverter（OCR 已内含）；最终交付只需打包 dist\PDFConverter 整个文件夹
+
+### 待优化
+
+> 以下为已记录、后续将作为重点处理的性能优化项（记录于 2026-09，具体根因以实测为准）。
+
+- [ ] **降低格式转换时的 CPU 占用**：转换过程中 CPU 持续 100%。扫描版走 PP-Structure OCR、paddle 为 CPU 逐页串行推理；后续可评估的方向包括 GPU 加速、页级并行（需先解决 paddle 线程安全）、模型量化等
+- [ ] **缩短大部头扫描书的 OCR 耗时**：一本 390 页的扫描书 OCR 转换约耗时 19 分钟；后续可评估降低渲染 DPI、并行处理、更换更轻量模型等提速方向
