@@ -6,6 +6,7 @@ import queue
 import traceback
 import tempfile
 import multiprocessing
+import threading
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -14,6 +15,31 @@ if TYPE_CHECKING:
     from pdf2docx import Converter
 
 logger = logging.getLogger(__name__)
+
+# paddle/paddleocr 的导入必须全局串行：paddle 非线程安全，并发 import 会触发
+# 其内部循环导入并报 "partially initialized module 'paddle' has no attribute
+# ..."，还会把半初始化子模块残留在 sys.modules 中，使此后每个任务都复用残缺
+# 缓存而持续失败。任务调度已保证工作线程串行（见 TaskManager._cleanup_worker），
+# 此锁为纵深防御，确保任何情况下都不会有两个线程同时导入 paddle。
+_OCR_IMPORT_LOCK = threading.Lock()
+
+
+def _purge_paddle_modules():
+    """清除 sys.modules 中所有 paddle 相关模块（含 paddleocr）。
+
+    paddle 导入被中断或并发失败后，sys.modules 会残留半初始化的子模块，
+    使后续 import 直接复用残缺缓存并持续报错。彻底清除后下次导入会重新执行，
+    从而恢复。仅在导入失败时调用；已成功导入并持有引用的调用方不受影响
+    （删缓存不会卸载已加载的模块对象与原生库）。
+    """
+    for name in [n for n in sys.modules if n.startswith('paddle')]:
+        del sys.modules[name]
+
+
+# 扫描版PDF分卷转换的每卷页数：一次性把整本（如906页/200万字）构建进
+# python-docx 会撑爆内存（lxml 文档树 + 保存序列化放大数倍），故每 50 页
+# 独立生成一个 docx 卷并立即落盘、释放，把内存峰值限制在单卷规模。
+_OCR_DOCX_CHUNK_PAGES = 50
 
 
 def _pdf2docx_worker(pdf_path, output_path, start, end, result_queue):
@@ -132,6 +158,8 @@ class PDFToWordConverter:
         """
         log = log or (lambda m: None)
         if self._ocr_engine is None:
+            # 串行化导入，避免与其他工作线程并发 import paddle 触发循环导入
+            _OCR_IMPORT_LOCK.acquire()
             try:
                 # 增强包存在时注入 sys.path（打包产物未内置 paddle，由增强包提供）。
                 # 依赖放在 site-packages 子目录：paddle 启动时按路径名包含
@@ -181,15 +209,27 @@ class PDFToWordConverter:
                 )
                 logger.info("PP-Structure引擎初始化完成")
             except ImportError as e:
+                # 半初始化的 paddle 也可能以 ImportError 形式抛出，一并清理
+                _purge_paddle_modules()
                 log(f"OCR 增强包不完整（缺少 paddle 依赖：{e}）")
                 logger.info(f"PaddleOCR不可用（{e}），扫描版PDF将使用图片模式转换")
                 logger.info("提示：安装 paddleocr 和 paddlepaddle 可启用OCR文字识别功能")
+                return None
+            except AttributeError as e:
+                # paddle 半初始化/内部循环导入（如 'paddle' has no attribute
+                # 'tensor'）：清理残留模块，使下一个任务能干净地重新导入
+                _purge_paddle_modules()
+                log(f"OCR 引擎初始化失败：{e}")
+                logger.info(f"PP-Structure引擎初始化失败（paddle 半初始化，已重置）: {e}")
+                logger.info("扫描版PDF将使用图片模式转换")
                 return None
             except Exception as e:
                 log(f"OCR 引擎初始化失败：{e}")
                 logger.info(f"PP-Structure引擎初始化失败: {e}")
                 logger.info("扫描版PDF将使用图片模式转换")
                 return None
+            finally:
+                _OCR_IMPORT_LOCK.release()
         return self._ocr_engine
 
     def _release_ocr_engine(self):
@@ -320,6 +360,10 @@ class PDFToWordConverter:
         对每一页：渲染为图片 → 版面分析（标题/正文/图片等区域）→ OCR识别
         → 阅读顺序恢复 → 官方 recovery 直出分层可编辑的 docx。
 
+        为避免超大文档（如906页）一次性构建 docx 撑爆内存，按每
+        _OCR_DOCX_CHUNK_PAGES 页分卷生成：第一卷用原始输出名，第2卷起追加
+        _partNN 后缀，各卷独立落盘并释放内存。
+
         如果PaddleOCR不可用，回退到图片模式（每页作为图片插入Word）。
 
         Args:
@@ -366,57 +410,108 @@ class PDFToWordConverter:
 
             logger.info(f"扫描版PDF，使用PP-Structure转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
 
-            # 中间产物（图片区域裁剪/docx）必须用 ASCII 临时目录：
-            # cv2.imwrite 在 Windows 上无法写入含中文的路径（静默失败）
-            temp_dir = tempfile.mkdtemp(prefix='pdf_ppstructure_')
+            # 分卷转换：每 _OCR_DOCX_CHUNK_PAGES 页独立构建一个 docx 卷并立即
+            # 落盘、释放该卷内存。避免把整本（如906页/200万字）一次性塞进
+            # python-docx —— lxml 文档树加保存序列化会把内存放大数倍而撑爆。
+            chunk_starts = list(range(start, actual_end, _OCR_DOCX_CHUNK_PAGES))
+            multi_volume = len(chunk_starts) > 1
+            out_stem = os.path.splitext(output_path)[0]
+            if multi_volume:
+                log(f"文档较大（{pages_to_convert}页），按每{_OCR_DOCX_CHUNK_PAGES}页分卷输出，共{len(chunk_starts)}卷")
 
-            all_res = []
-            last_img = None
-            for page_idx in range(start, actual_end):
+            output_files = []
+            for vol_idx, chunk_start in enumerate(chunk_starts, start=1):
                 if self._is_cancelled:
                     break
+                chunk_end = min(chunk_start + _OCR_DOCX_CHUNK_PAGES, actual_end)
 
-                current_page = page_idx - start + 1
-                if progress_callback:
-                    progress_callback(current_page, pages_to_convert)
+                # 每卷独立 ASCII 临时目录：save_structure_res 的 img_idx 卷内从0起，
+                # 独立目录避免跨卷图名冲突，卷末即清理释放磁盘与内存
+                # （cv2.imwrite 在 Windows 无法写含中文路径，故必须用 ASCII 临时目录）
+                temp_dir = tempfile.mkdtemp(prefix='pdf_ppstructure_')
+                chunk_res = []
+                last_img = None
+                try:
+                    for page_idx in range(chunk_start, chunk_end):
+                        if self._is_cancelled:
+                            break
 
-                logger.info(f"PP-Structure识别第 {page_idx + 1}/{total_pages} 页...")
+                        current_page = page_idx - start + 1
+                        if progress_callback:
+                            progress_callback(current_page, pages_to_convert)
 
-                # 渲染页面为 BGR ndarray
-                pix = doc[page_idx].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-                img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                    pix.height, pix.width, pix.n
-                )
-                if pix.n == 4:
-                    img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-                else:
-                    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+                        logger.info(f"PP-Structure识别第 {page_idx + 1}/{total_pages} 页...")
 
-                # 版面分析 + OCR；img_idx 用于多页结果在 docx 中分页
-                rel_idx = page_idx - start
-                result = engine(img, img_idx=rel_idx)
-                # 图片区域裁剪落盘，convert_info_docx 生成 docx 时需要读取
-                save_structure_res(result, temp_dir, doc_name, img_idx=rel_idx)
-                res = sorted_layout_boxes(result, img.shape[1])
-                all_res += res
-                last_img = img
+                        # 渲染页面为 BGR ndarray
+                        pix = doc[page_idx].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                            pix.height, pix.width, pix.n
+                        )
+                        if pix.n == 4:
+                            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+                        else:
+                            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+                        # 版面分析 + OCR；rel_idx 卷内从0，用于图名与 docx 分页
+                        rel_idx = page_idx - chunk_start
+                        result = engine(img, img_idx=rel_idx)
+                        # 图片区域裁剪落盘，convert_info_docx 生成 docx 时需要读取
+                        save_structure_res(result, temp_dir, doc_name, img_idx=rel_idx)
+                        res = sorted_layout_boxes(result, img.shape[1])
+                        chunk_res += res
+                        last_img = img
+
+                    if self._is_cancelled:
+                        break
+
+                    if not chunk_res:
+                        logger.info(f"第{vol_idx}卷（第{chunk_start + 1}-{chunk_end}页）无识别内容，跳过")
+                        continue
+
+                    # 仅构建本卷 docx（内存峰值≈单卷），随即落盘
+                    convert_info_docx(last_img, chunk_res, temp_dir, doc_name)
+                    temp_docx = os.path.join(temp_dir, f'{doc_name}_ocr.docx')
+                    if not os.path.exists(temp_docx):
+                        return False, f"第{vol_idx}卷转换完成但输出文件不存在"
+
+                    # 第一卷沿用原始输出名（保证 output_word 指向有效文件），
+                    # 第2卷起追加 _partNN 后缀，与第一卷同目录
+                    if multi_volume and vol_idx > 1:
+                        vol_path = f"{out_stem}_part{vol_idx:02d}.docx"
+                    else:
+                        vol_path = output_path
+                    shutil.move(temp_docx, vol_path)
+                    output_files.append(vol_path)
+                    logger.info(
+                        f"第{vol_idx}/{len(chunk_starts)}卷完成"
+                        f"（第{chunk_start + 1}-{chunk_end}页）: {vol_path} "
+                        f"[{os.path.getsize(vol_path) / 1024:.1f}KB]"
+                    )
+                finally:
+                    # 释放本卷内存与临时目录，再处理下一卷
+                    chunk_res = None
+                    last_img = None
+                    if temp_dir:
+                        shutil.rmtree(temp_dir, ignore_errors=True)
+                        temp_dir = None
+                    gc.collect()
 
             if self._is_cancelled:
                 return False, "转换被用户中断"
 
-            if not all_res:
+            if not output_files:
                 return False, "PP-Structure未识别出任何内容"
 
-            # 生成 docx（写到 ASCII 临时目录），再移动到用户目标路径
-            convert_info_docx(last_img, all_res, temp_dir, doc_name)
-            temp_docx = os.path.join(temp_dir, f'{doc_name}_ocr.docx')
-            if not os.path.exists(temp_docx):
-                return False, "转换完成但输出文件不存在"
-            shutil.move(temp_docx, output_path)
+            if multi_volume:
+                logger.info(f"PP-Structure转换完成，共生成{len(output_files)}卷")
+                return True, (
+                    f"成功转换（文档较大，共{len(chunk_starts)}卷）：主文件 {output_files[0]}，"
+                    f"其余分卷（_partNN）在同一目录"
+                )
 
-            file_size_kb = os.path.getsize(output_path) / 1024
+            file_size_kb = os.path.getsize(output_files[0]) / 1024
             logger.info(f"PP-Structure转换完成，文件大小: {file_size_kb:.1f}KB")
-            return True, f"成功转换到: {output_path}"
+            return True, f"成功转换到: {output_files[0]}"
 
         except MemoryError:
             return False, "内存不足，OCR转换需要较多内存，请尝试转换较少页数"

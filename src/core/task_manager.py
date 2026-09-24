@@ -116,12 +116,31 @@ class TaskManager(QObject):
         worker.start()
     
     def _cleanup_worker(self, task_id: str):
-        """工作线程结束后的清理（由 finished 信号触发，此时线程已安全退出）"""
+        """工作线程结束后的清理与调度（由 finished 信号触发，线程已安全退出）
+
+        并发槽（running_tasks）的释放严格绑定线程生命周期：线程真正结束才移除，
+        并在此之后再调度下一个任务。即便取消正在运行的任务，新任务也必须等旧线程
+        退出才启动，从根本上杜绝两个线程并发 import/使用非线程安全的 paddle
+        （并发导入会触发 paddle 内部循环导入并污染 sys.modules）。
+        """
         worker = self.workers.pop(task_id, None)
         if worker is not None:
             # 释放转换器对象
             worker.word_converter = None
             worker.deleteLater()
+
+        # 线程已退出，释放其占用的并发槽
+        self.running_tasks.discard(task_id)
+        self._update_queue_status()
+
+        # 调度下一个等待中的任务（此刻已无其它工作线程在运行）
+        if self.is_running:
+            self._try_start_next_task()
+
+        # 队列清空且无运行中线程，广播全部完成以恢复界面状态
+        if not self.pending_queue and not self.running_tasks:
+            self.is_running = False
+            self.all_tasks_finished.emit()
     
     def _on_task_progress(self, task_id: str, status_message: str):
         """任务进度回调"""
@@ -132,22 +151,14 @@ class TaskManager(QObject):
         self.task_log.emit(task_id, message)
     
     def _on_task_finished(self, task_id: str, success: bool, message: str):
-        """任务完成回调"""
-        if task_id in self.running_tasks:
-            self.running_tasks.remove(task_id)
-            self.completed_tasks.add(task_id)
-        
+        """任务完成回调（业务层）：仅更新完成状态并向界面广播。
+
+        并发槽释放与下一个任务的调度统一由 _cleanup_worker（线程真正结束后）
+        负责，确保任意时刻至多一个工作线程在运行，杜绝并发导入 paddle。
+        """
+        self.completed_tasks.add(task_id)
         self.task_finished.emit(task_id, success, message)
         self._update_queue_status()
-        
-        # 尝试启动下一个任务
-        if self.is_running:
-            self._try_start_next_task()
-        
-        # 检查是否所有任务都完成了
-        if not self.pending_queue and not self.running_tasks:
-            self.is_running = False
-            self.all_tasks_finished.emit()
     
     def cancel_task(self, task_id: str) -> bool:
         """取消指定任务"""
@@ -161,29 +172,19 @@ class TaskManager(QObject):
             return True
         
         elif task_id in self.running_tasks and task_id in self.workers:
-            # 任务正在运行，通知工作线程协作式取消（不阻塞等待，
-            # 线程结束后由 finished 信号触发 _cleanup_worker 清理）
+            # 任务正在运行：仅通知工作线程协作式取消，不在此释放并发槽、
+            # 也不立即调度下一个任务。旧线程此刻可能仍在 import/使用 paddle，
+            # 必须等它 finished 后由 _cleanup_worker 释放并发槽并启动下一个，
+            # 否则新旧线程会并发导入 paddle 触发循环导入并污染 sys.modules。
             worker = self.workers[task_id]
             worker.cancel()
-            
+
             if task_id in self.tasks:
                 self.tasks[task_id].cancel()
-            
-            self.running_tasks.remove(task_id)
+
             self.completed_tasks.add(task_id)
-            
             self.task_cancelled.emit(task_id)
             self._update_queue_status()
-            
-            # 尝试启动下一个任务
-            if self.is_running:
-                self._try_start_next_task()
-            
-            # 检查是否所有任务都完成了
-            if not self.pending_queue and not self.running_tasks:
-                self.is_running = False
-                self.all_tasks_finished.emit()
-            
             return True
         
         return False

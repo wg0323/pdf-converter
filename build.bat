@@ -100,9 +100,9 @@ if exist "dist\PDFConverter\PDFConverter.exe" (
     echo   Double-click PDFConverter.exe inside it to run
     echo.
     echo Features:
-    echo   - PDF to Word (.docx^)
+    echo   - PDF to Word ^(.docx^)
     echo   - Task queue management
-    echo   - Sequential conversion (stable)
+    echo   - Sequential conversion ^(stable^)
     echo   - Black cat theme icon
     echo.
 ) else (

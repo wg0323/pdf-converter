@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 import os
+from PyInstaller.utils.hooks import collect_submodules
 
 block_cipher = None
 
@@ -74,7 +75,11 @@ a = Analysis(
         'src.core.single_task_worker',
         'src.core.pdf_to_word',
         'src.ui.main_window_v2',
-    ] + OCR_ADDON_STDLIB,
+        # PIL 需完整收集：主程序仅用 PIL.Image，PyInstaller 默认只打包 Image
+        # 子模块；而 ocr_addon 里的 paddleocr 运行时还需 ImageEnhance 等子模块。
+        # 冻结环境中内置 PIL 父包优先、会屏蔽 addon 自带的完整 PIL，导致
+        # cannot import name ImageEnhance from PIL 报错。故补全内置 PIL 子模块。
+    ] + OCR_ADDON_STDLIB + collect_submodules('PIL'),
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
