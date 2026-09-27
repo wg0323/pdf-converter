@@ -2,6 +2,16 @@
 
 一款基于 PyQt6 的 Windows 桌面应用，将 PDF 文件批量转换为 Word（.docx）文档。支持普通 PDF 与扫描版 PDF：普通 PDF 保留排版与图片，扫描版在 `ocr_addon` 增强包存在时通过 PP-Structure OCR 直出分层可编辑 Word，否则自动降级为整页图片模式。
 
+## 效果预览
+
+以大部头扫描书《领域驱动设计：软件核心复杂性应对之道》（391 页）为例，扫描版 PDF 经 PP-Structure 版面分析 + OCR 还原为分层可编辑 Word 的前后对比：
+
+| 原版 PDF | 转换后 Word |
+| --- | --- |
+| ![原版对比1](docs/images/pdf-page-1.png) | ![转换后对比1](docs/images/docx-result-1.png) |
+| ![原版对比2](docs/images/pdf-page-2.png) | ![转换后对比2](docs/images/docx-result-2.png) |
+| ![原版对比3](docs/images/pdf-page-3.png) | ![转换后对比3](docs/images/docx-result-3.png) |
+
 ## 功能特点
 
 - **PDF 转 Word**：普通 PDF 使用 pdf2docx 转换，保留排版与图片
