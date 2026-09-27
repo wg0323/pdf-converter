@@ -1,12 +1,13 @@
 import os
 import gc
 import sys
+import time
+import ctypes
 import logging
 import queue
 import traceback
 import tempfile
 import multiprocessing
-import threading
 from pathlib import Path
 from typing import Optional, TYPE_CHECKING
 
@@ -16,30 +17,19 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# paddle/paddleocr 的导入必须全局串行：paddle 非线程安全，并发 import 会触发
-# 其内部循环导入并报 "partially initialized module 'paddle' has no attribute
-# ..."，还会把半初始化子模块残留在 sys.modules 中，使此后每个任务都复用残缺
-# 缓存而持续失败。任务调度已保证工作线程串行（见 TaskManager._cleanup_worker），
-# 此锁为纵深防御，确保任何情况下都不会有两个线程同时导入 paddle。
-_OCR_IMPORT_LOCK = threading.Lock()
-
-
-def _purge_paddle_modules():
-    """清除 sys.modules 中所有 paddle 相关模块（含 paddleocr）。
-
-    paddle 导入被中断或并发失败后，sys.modules 会残留半初始化的子模块，
-    使后续 import 直接复用残缺缓存并持续报错。彻底清除后下次导入会重新执行，
-    从而恢复。仅在导入失败时调用；已成功导入并持有引用的调用方不受影响
-    （删缓存不会卸载已加载的模块对象与原生库）。
-    """
-    for name in [n for n in sys.modules if n.startswith('paddle')]:
-        del sys.modules[name]
-
-
 # 扫描版PDF分卷转换的每卷页数：一次性把整本（如906页/200万字）构建进
 # python-docx 会撑爆内存（lxml 文档树 + 保存序列化放大数倍），故每 50 页
 # 独立生成一个 docx 卷并立即落盘、释放，把内存峰值限制在单卷规模。
 _OCR_DOCX_CHUNK_PAGES = 50
+
+# OCR 子进程 → 父进程 的消息类型与结果哨兵
+_OCR_MSG_PROGRESS = 'progress'      # (页进度: 当前页, 总页数)
+_OCR_MSG_LOG = 'log'                # (用户可见日志文本)
+_OCR_MSG_RESULT = 'result'          # (最终结果: 是否成功, 消息)
+# OCR 不可用（增强包缺失/依赖损坏/引擎初始化失败），父进程据此回退图片模式
+_OCR_UNAVAILABLE = '__OCR_UNAVAILABLE__'
+# 子进程原生崩溃（exitcode 非0），父进程据此尝试关闭 MKLDNN 重跑
+_OCR_CRASH = '__OCR_CRASH__'
 
 
 def _pdf2docx_worker(pdf_path, output_path, start, end, result_queue):
@@ -68,10 +58,293 @@ def _pdf2docx_worker(pdf_path, output_path, start, end, result_queue):
         result_queue.put((False, f"转换失败: {e}"))
 
 
+def _ocr_cpu_threads() -> int:
+    """OCR CPU 推理线程数：对齐物理核估计（逻辑核数的一半，至少 2）。
+
+    超线程对 MKLDNN 数值计算无收益，线程数超过物理核反而增加调度开销。
+    """
+    return max(2, (os.cpu_count() or 8) // 2)
+
+
+def _find_ocr_addon_dir() -> Optional[str]:
+    """
+    查找 OCR 增强包目录（ocr_addon）
+
+    增强包内含 paddle/paddleocr 及其依赖与离线模型，单独分发，
+    用户解压到程序目录内即可启用 OCR。
+    打包环境找 exe 同级目录，开发环境找项目根目录。
+
+    Returns:
+        增强包目录路径，不存在则返回 None
+    """
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = str(Path(__file__).resolve().parents[2])
+    addon_dir = os.path.join(base_dir, 'ocr_addon')
+    return addon_dir if os.path.isdir(addon_dir) else None
+
+
+def _setup_ocr_addon_paths(addon_dir: str):
+    """
+    把增强包 site-packages 注入 sys.path 并修正 site.USER_SITE。
+
+    依赖放在 site-packages 子目录：paddle 启动时按路径名包含
+    "site-packages" 定位原生库目录，否则在冻结环境回退到
+    site.USER_SITE（为 None）而崩溃；PyInstaller 冻结环境下
+    site.USER_SITE 为 None，而 paddle 启动时会用它拼接原生库路径
+    （不判空，直接 TypeError），指向增强包 site-packages 使其能
+    定位 paddle/libs。
+    """
+    addon_site = os.path.join(addon_dir, 'site-packages')
+    if os.path.isdir(addon_site) and addon_site not in sys.path:
+        sys.path.insert(0, addon_site)
+    import site
+    if getattr(site, 'USER_SITE', None) is None:
+        site.USER_SITE = addon_site
+
+
+def _create_ocr_engine(addon_dir: str, use_mkldnn: bool):
+    """
+    创建 PP-Structure 引擎（仅在 OCR 子进程内调用）
+
+    PP-Structure = 版面分析 + OCR + 阅读顺序恢复，可直出分层可编辑的 Word。
+    优先使用增强包内的离线模型，避免首次使用时联网下载；
+    开启 MKLDNN 加速 CPU 推理，线程数对齐物理核。
+    """
+    _setup_ocr_addon_paths(addon_dir)
+    from paddleocr import PPStructure
+
+    model_kwargs = {}
+    models_dir = os.path.join(addon_dir, 'models')
+    for name, param in (
+        ('det', 'det_model_dir'),
+        ('rec', 'rec_model_dir'),
+        ('layout', 'layout_model_dir'),
+    ):
+        model_dir = os.path.join(models_dir, name)
+        if os.path.isdir(model_dir):
+            model_kwargs[param] = model_dir
+
+    # table=False：表格模型与 paddlepaddle 2.6 存在加载兼容问题，
+    # 表格区域按图片处理；recovery=True 启用阅读顺序恢复；
+    # rec_batch_num=24：密集页一页 det 出 40+ 文本行，默认批 6 要跑 7 批
+    # （调度开销占比高），提到 24 后实测页均 2.07s→1.67s（-19%，纯批调度
+    # 优化，识别结果不变）
+    return PPStructure(
+        recovery=True,
+        table=False,
+        lang='ch',
+        show_log=False,
+        enable_mkldnn=use_mkldnn,
+        cpu_threads=_ocr_cpu_threads(),
+        rec_batch_num=24,
+        **model_kwargs
+    )
+
+
+def _ocr_worker(pdf_path, output_path, start, end, msg_queue, use_mkldnn):
+    """
+    在独立子进程中执行扫描版 PDF 的 PP-Structure OCR 转换。
+
+    - 低优先级运行（Windows BELOW_NORMAL）：paddle CPU 推理会吃满所有
+      核心，降低进程优先级保证转换期间 GUI 与其他前台程序仍然可用；
+    - 通过 msg_queue 向父进程发送 progress/log/result 三类消息；
+    - 取消由父进程 terminate 子进程实现，无需协作式检查。
+
+    转换主体：每页渲染为图片 → 版面分析（标题/正文/图片等区域）→ OCR
+    识别 → 阅读顺序恢复 → 官方 recovery 直出分层可编辑的 docx。
+    为避免超大文档（如906页）一次性构建 docx 撑爆内存，按每
+    _OCR_DOCX_CHUNK_PAGES 页分卷生成：第一卷用原始输出名，第2卷起追加
+    _partNN 后缀，各卷独立落盘并释放内存。
+    """
+    # Windows：降低进程优先级，OCR 满载时前台程序不受拖累
+    if sys.platform == 'win32':
+        try:
+            kernel32 = ctypes.windll.kernel32
+            # 0x4000 = BELOW_NORMAL_PRIORITY_CLASS
+            kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), 0x4000)
+        except Exception:
+            pass
+
+    def log(message):
+        msg_queue.put((_OCR_MSG_LOG, message))
+
+    def finish(success, message):
+        msg_queue.put((_OCR_MSG_RESULT, success, message))
+
+    addon_dir = _find_ocr_addon_dir()
+    if addon_dir is None:
+        finish(False, _OCR_UNAVAILABLE)
+        return
+
+    try:
+        t_init = time.time()
+        engine = _create_ocr_engine(addon_dir, use_mkldnn)
+        log(
+            f"已启用 OCR 文字识别（PP-Structure，MKLDNN {'开' if use_mkldnn else '关'}，"
+            f"CPU 线程数 {_ocr_cpu_threads()}），开始逐页识别..."
+            f"（引擎初始化 {time.time() - t_init:.1f}s）"
+        )
+    except ImportError as e:
+        # 半初始化的 paddle 也可能以 ImportError 形式抛出（增强包不完整）
+        log(f"OCR 增强包不完整（缺少 paddle 依赖：{e}）")
+        finish(False, _OCR_UNAVAILABLE)
+        return
+    except Exception as e:
+        log(f"OCR 引擎初始化失败：{e}")
+        finish(False, _OCR_UNAVAILABLE)
+        return
+
+    import fitz
+    import shutil
+    import numpy as np
+    import cv2
+    from paddleocr import save_structure_res
+    from paddleocr.ppstructure.recovery.recovery_to_doc import (
+        sorted_layout_boxes, convert_info_docx,
+    )
+
+    doc = None
+    temp_dir = None
+    doc_name = 'ppstructure_result'
+    zoom = 200 / 72  # 200 DPI
+    t_total = time.time()
+    infer_seconds = 0.0
+    pages_done = 0
+
+    try:
+        doc = fitz.open(pdf_path)
+        total_pages = len(doc)
+        actual_end = min(end if end is not None else total_pages, total_pages)
+        pages_to_convert = actual_end - start
+
+        logger.info(f"扫描版PDF，使用PP-Structure转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
+
+        # 分卷转换：每 _OCR_DOCX_CHUNK_PAGES 页独立构建一个 docx 卷并立即
+        # 落盘、释放该卷内存。避免把整本（如906页/200万字）一次性塞进
+        # python-docx —— lxml 文档树加保存序列化会把内存放大数倍而撑爆。
+        chunk_starts = list(range(start, actual_end, _OCR_DOCX_CHUNK_PAGES))
+        multi_volume = len(chunk_starts) > 1
+        out_stem = os.path.splitext(output_path)[0]
+        if multi_volume:
+            log(f"文档较大（{pages_to_convert}页），按每{_OCR_DOCX_CHUNK_PAGES}页分卷输出，共{len(chunk_starts)}卷")
+
+        output_files = []
+        for vol_idx, chunk_start in enumerate(chunk_starts, start=1):
+            chunk_end = min(chunk_start + _OCR_DOCX_CHUNK_PAGES, actual_end)
+
+            # 每卷独立 ASCII 临时目录：save_structure_res 的 img_idx 卷内从0起，
+            # 独立目录避免跨卷图名冲突，卷末即清理释放磁盘与内存
+            # （cv2.imwrite 在 Windows 无法写含中文路径，故必须用 ASCII 临时目录）
+            temp_dir = tempfile.mkdtemp(prefix='pdf_ppstructure_')
+            chunk_res = []
+            last_img = None
+            try:
+                for page_idx in range(chunk_start, chunk_end):
+                    current_page = page_idx - start + 1
+                    msg_queue.put((_OCR_MSG_PROGRESS, current_page, pages_to_convert))
+
+                    logger.info(f"PP-Structure识别第 {page_idx + 1}/{total_pages} 页...")
+
+                    # 渲染页面为 BGR ndarray
+                    pix = doc[page_idx].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+                    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+                        pix.height, pix.width, pix.n
+                    )
+                    if pix.n == 4:
+                        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+                    else:
+                        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+
+                    # 版面分析 + OCR；rel_idx 卷内从0，用于图名与 docx 分页
+                    rel_idx = page_idx - chunk_start
+                    t_page = time.time()
+                    result = engine(img, img_idx=rel_idx)
+                    infer_seconds += time.time() - t_page
+                    pages_done += 1
+
+                    # 图片区域裁剪落盘，convert_info_docx 生成 docx 时需要读取
+                    save_structure_res(result, temp_dir, doc_name, img_idx=rel_idx)
+                    res = sorted_layout_boxes(result, img.shape[1])
+                    chunk_res += res
+                    last_img = img
+
+                if not chunk_res:
+                    logger.info(f"第{vol_idx}卷（第{chunk_start + 1}-{chunk_end}页）无识别内容，跳过")
+                    continue
+
+                # 仅构建本卷 docx（内存峰值≈单卷），随即落盘
+                convert_info_docx(last_img, chunk_res, temp_dir, doc_name)
+                temp_docx = os.path.join(temp_dir, f'{doc_name}_ocr.docx')
+                if not os.path.exists(temp_docx):
+                    finish(False, f"第{vol_idx}卷转换完成但输出文件不存在")
+                    return
+
+                # 第一卷沿用原始输出名（保证 output_word 指向有效文件），
+                # 第2卷起追加 _partNN 后缀，与第一卷同目录
+                if multi_volume and vol_idx > 1:
+                    vol_path = f"{out_stem}_part{vol_idx:02d}.docx"
+                else:
+                    vol_path = output_path
+                shutil.move(temp_docx, vol_path)
+                output_files.append(vol_path)
+                logger.info(
+                    f"第{vol_idx}/{len(chunk_starts)}卷完成"
+                    f"（第{chunk_start + 1}-{chunk_end}页）: {vol_path} "
+                    f"[{os.path.getsize(vol_path) / 1024:.1f}KB]"
+                )
+            finally:
+                # 释放本卷内存与临时目录，再处理下一卷
+                chunk_res = None
+                last_img = None
+                if temp_dir:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+                    temp_dir = None
+                gc.collect()
+
+        if pages_done:
+            log(
+                f"OCR 识别完成：{pages_done} 页共 {infer_seconds:.0f}s，"
+                f"页均 {infer_seconds / pages_done:.2f}s，总耗时 {time.time() - t_total:.0f}s"
+            )
+
+        if not output_files:
+            finish(False, "PP-Structure未识别出任何内容")
+            return
+
+        if multi_volume:
+            logger.info(f"PP-Structure转换完成，共生成{len(output_files)}卷")
+            finish(True, (
+                f"成功转换（文档较大，共{len(chunk_starts)}卷）：主文件 {output_files[0]}，"
+                f"其余分卷（_partNN）在同一目录"
+            ))
+        else:
+            file_size_kb = os.path.getsize(output_files[0]) / 1024
+            logger.info(f"PP-Structure转换完成，文件大小: {file_size_kb:.1f}KB")
+            finish(True, f"成功转换到: {output_files[0]}")
+
+    except MemoryError:
+        finish(False, "内存不足，OCR转换需要较多内存，请尝试转换较少页数")
+
+    except Exception as e:
+        logger.error(f"错误详情:\n{traceback.format_exc()}")
+        finish(False, f"OCR转换失败: {str(e)}")
+
+    finally:
+        # 统一释放资源：异常/正常路径都会执行
+        if doc is not None:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 class PDFToWordConverter:
     def __init__(self):
         self.converter: Optional["Converter"] = None
-        self._ocr_engine = None
         self._is_cancelled = False
         self._process: Optional[multiprocessing.Process] = None
 
@@ -121,123 +394,6 @@ class PDFToWordConverter:
         except Exception as e:
             logger.info(f"检测PDF类型时出错: {e}")
             return False
-
-    # ========== OCR引擎管理 ==========
-
-    @staticmethod
-    def _find_ocr_addon() -> Optional[str]:
-        """
-        查找 OCR 增强包目录（ocr_addon）
-
-        增强包内含 paddle/paddleocr 及其依赖与离线模型，单独分发，
-        用户解压到程序目录内即可启用 OCR。
-        打包环境找 exe 同级目录，开发环境找项目根目录。
-
-        Returns:
-            增强包目录路径，不存在则返回 None
-        """
-        if getattr(sys, 'frozen', False):
-            base_dir = os.path.dirname(sys.executable)
-        else:
-            base_dir = str(Path(__file__).resolve().parents[2])
-        addon_dir = os.path.join(base_dir, 'ocr_addon')
-        return addon_dir if os.path.isdir(addon_dir) else None
-
-    def _get_ocr_engine(self, log=None):
-        """
-        获取 PP-Structure 引擎实例（懒加载，首次使用时初始化）
-
-        PP-Structure = 版面分析 + OCR + 阅读顺序恢复，可直出分层可编辑的 Word。
-        优先使用 OCR 增强包（ocr_addon）中的依赖与离线模型。
-
-        Args:
-            log: 可选的界面日志回调（接收一个字符串），用于向用户透传启用/降级原因
-
-        Returns:
-            PPStructure 实例，如果不可用则返回 None
-        """
-        log = log or (lambda m: None)
-        if self._ocr_engine is None:
-            # 串行化导入，避免与其他工作线程并发 import paddle 触发循环导入
-            _OCR_IMPORT_LOCK.acquire()
-            try:
-                # 增强包存在时注入 sys.path（打包产物未内置 paddle，由增强包提供）。
-                # 依赖放在 site-packages 子目录：paddle 启动时按路径名包含
-                # "site-packages" 定位原生库目录，否则在冻结环境回退到
-                # site.USER_SITE（为 None）而崩溃
-                addon_dir = self._find_ocr_addon()
-                if addon_dir is None:
-                    log("未找到 OCR 增强包（程序目录下缺少 ocr_addon 文件夹）")
-                    logger.info("未找到 OCR 增强包，扫描版PDF将使用图片模式转换")
-                    return None
-                if addon_dir:
-                    addon_site = os.path.join(addon_dir, 'site-packages')
-                    if os.path.isdir(addon_site) and addon_site not in sys.path:
-                        sys.path.insert(0, addon_site)
-                    # PyInstaller 冻结环境下 site.USER_SITE 为 None，而 paddle
-                    # 启动时会用它拼接原生库路径（不判空，直接 TypeError），
-                    # 指向增强包 site-packages 使其能定位 paddle/libs
-                    import site
-                    if getattr(site, 'USER_SITE', None) is None:
-                        site.USER_SITE = addon_site
-
-                from paddleocr import PPStructure
-                logger.info("正在初始化PP-Structure引擎...")
-                log("正在初始化 OCR 引擎（首次较慢）...")
-
-                # 优先使用增强包内的离线模型，避免首次使用时联网下载
-                model_kwargs = {}
-                if addon_dir:
-                    models_dir = os.path.join(addon_dir, 'models')
-                    for name, param in (
-                        ('det', 'det_model_dir'),
-                        ('rec', 'rec_model_dir'),
-                        ('layout', 'layout_model_dir'),
-                    ):
-                        model_dir = os.path.join(models_dir, name)
-                        if os.path.isdir(model_dir):
-                            model_kwargs[param] = model_dir
-
-                # table=False：表格模型与 paddlepaddle 2.6 存在加载兼容问题，
-                # 表格区域按图片处理；recovery=True 启用阅读顺序恢复
-                self._ocr_engine = PPStructure(
-                    recovery=True,
-                    table=False,
-                    lang='ch',
-                    show_log=False,
-                    **model_kwargs
-                )
-                logger.info("PP-Structure引擎初始化完成")
-            except ImportError as e:
-                # 半初始化的 paddle 也可能以 ImportError 形式抛出，一并清理
-                _purge_paddle_modules()
-                log(f"OCR 增强包不完整（缺少 paddle 依赖：{e}）")
-                logger.info(f"PaddleOCR不可用（{e}），扫描版PDF将使用图片模式转换")
-                logger.info("提示：安装 paddleocr 和 paddlepaddle 可启用OCR文字识别功能")
-                return None
-            except AttributeError as e:
-                # paddle 半初始化/内部循环导入（如 'paddle' has no attribute
-                # 'tensor'）：清理残留模块，使下一个任务能干净地重新导入
-                _purge_paddle_modules()
-                log(f"OCR 引擎初始化失败：{e}")
-                logger.info(f"PP-Structure引擎初始化失败（paddle 半初始化，已重置）: {e}")
-                logger.info("扫描版PDF将使用图片模式转换")
-                return None
-            except Exception as e:
-                log(f"OCR 引擎初始化失败：{e}")
-                logger.info(f"PP-Structure引擎初始化失败: {e}")
-                logger.info("扫描版PDF将使用图片模式转换")
-                return None
-            finally:
-                _OCR_IMPORT_LOCK.release()
-        return self._ocr_engine
-
-    def _release_ocr_engine(self):
-        """释放OCR引擎资源"""
-        if self._ocr_engine is not None:
-            del self._ocr_engine
-            self._ocr_engine = None
-            gc.collect()
 
     def _convert_scanned_pdf_as_images(
         self,
@@ -355,14 +511,11 @@ class PDFToWordConverter:
         log_callback=None
     ) -> tuple[bool, str]:
         """
-        使用 PP-Structure 将扫描版PDF转换为Word文档
+        使用 PP-Structure 将扫描版PDF转换为Word文档（独立子进程执行）
 
-        对每一页：渲染为图片 → 版面分析（标题/正文/图片等区域）→ OCR识别
-        → 阅读顺序恢复 → 官方 recovery 直出分层可编辑的 docx。
-
-        为避免超大文档（如906页）一次性构建 docx 撑爆内存，按每
-        _OCR_DOCX_CHUNK_PAGES 页分卷生成：第一卷用原始输出名，第2卷起追加
-        _partNN 后缀，各卷独立落盘并释放内存。
+        OCR 推理在独立子进程中运行：paddle CPU 推理会吃满所有核心，
+        放在 GUI 进程内会拖垮界面；子进程同时设为低优先级，转换期间
+        机器保持可用，崩溃也不连累 GUI（与 pdf2docx 隔离策略一致）。
 
         如果PaddleOCR不可用，回退到图片模式（每页作为图片插入Word）。
 
@@ -378,159 +531,138 @@ class PDFToWordConverter:
             (是否成功, 消息/错误信息)
         """
         log = log_callback or (lambda m: None)
-        engine = self._get_ocr_engine(log=log)
 
-        if engine is None:
-            # OCR不可用，回退到图片模式（降级原因已由 _get_ocr_engine 透传）
+        # 增强包目录缺失直接走图片模式，避免无谓地拉起子进程
+        if _find_ocr_addon_dir() is None:
+            log("未找到 OCR 增强包（程序目录下缺少 ocr_addon 文件夹）")
+            logger.info("未找到 OCR 增强包，扫描版PDF将使用图片模式转换")
+            return self._convert_scanned_pdf_as_images(
+                pdf_path, output_path, start, end, progress_callback
+            )
+
+        success, msg = self._run_ocr_isolated(
+            pdf_path, output_path, start, end, progress_callback, log
+        )
+        if success:
+            return True, msg
+        if msg == _OCR_UNAVAILABLE:
+            # OCR不可用，回退到图片模式（降级原因已由子进程日志透传）
             log("未启用 OCR，改用图片模式转换扫描版 PDF（输出为图片，无可编辑文字）")
             logger.info("OCR不可用，使用图片模式转换扫描版PDF")
             return self._convert_scanned_pdf_as_images(
                 pdf_path, output_path, start, end, progress_callback
             )
-        log("已启用 OCR 文字识别（PP-Structure），开始逐页识别...")
-        import fitz
-        import shutil
-        import numpy as np
-        import cv2
-        from paddleocr import save_structure_res
-        from paddleocr.ppstructure.recovery.recovery_to_doc import (
-            sorted_layout_boxes, convert_info_docx,
+        if msg == _OCR_CRASH:
+            return False, "OCR 子进程异常退出，无法完成转换"
+        logger.info(f"OCR转换失败: {msg}")
+        return False, msg
+
+    def _run_ocr_isolated(
+        self,
+        pdf_path: str,
+        output_path: str,
+        start: int,
+        end: Optional[int],
+        progress_callback,
+        log
+    ) -> tuple[bool, str]:
+        """
+        在独立子进程中运行 OCR 转换（含 MKLDNN 故障自动降级重试）
+
+        MKLDNN 在部分 Windows CPU 型号上存在原生崩溃的已知案例：默认首次
+        尝试开启 MKLDNN，若引擎初始化失败或子进程崩溃，自动降级为关闭
+        MKLDNN 重试一次；仍失败则如实返回。设置环境变量
+        PDFCONVERTER_NO_MKLDNN=1 可强制全程关闭 MKLDNN。
+
+        Returns:
+            (是否成功, 消息；OCR 不可用时为 _OCR_UNAVAILABLE 哨兵)
+        """
+        if os.environ.get('PDFCONVERTER_NO_MKLDNN', '') == '1':
+            attempts = [False]
+        else:
+            attempts = [True, False]
+
+        result = (False, _OCR_CRASH)
+        for idx, use_mkldnn in enumerate(attempts):
+            result = self._spawn_ocr_worker(
+                pdf_path, output_path, start, end, use_mkldnn,
+                progress_callback, log
+            )
+            if result[0] or idx == len(attempts) - 1:
+                return result
+            # 仅当失败疑似与 MKLDNN 相关（引擎初始化失败/子进程崩溃）时
+            # 才值得降级重试；普通转换失败或用户取消重试无意义
+            if result[1] not in (_OCR_UNAVAILABLE, _OCR_CRASH):
+                return result
+            log("MKLDNN 加速初始化失败或运行中崩溃，自动降级为关闭 MKLDNN 重试...")
+        return result
+
+    def _spawn_ocr_worker(
+        self,
+        pdf_path: str,
+        output_path: str,
+        start: int,
+        end: Optional[int],
+        use_mkldnn: bool,
+        progress_callback,
+        log
+    ) -> tuple[bool, str]:
+        """
+        拉起 OCR 子进程并转发其进度/日志消息，直到子进程结束
+
+        Returns:
+            (是否成功, 消息/哨兵)
+        """
+        ctx = multiprocessing.get_context("spawn")
+        msg_queue = ctx.Queue()
+        proc = ctx.Process(
+            target=_ocr_worker,
+            args=(pdf_path, output_path, start, end, msg_queue, use_mkldnn),
         )
+        self._process = proc
+        proc.start()
 
-        doc = None
-        temp_dir = None
-        doc_name = 'ppstructure_result'
-        zoom = 200 / 72  # 200 DPI
+        result = None
 
-        try:
-            doc = fitz.open(pdf_path)
-            total_pages = len(doc)
-            actual_end = min(end if end is not None else total_pages, total_pages)
-            pages_to_convert = actual_end - start
+        def handle(msg):
+            nonlocal result
+            kind = msg[0]
+            if kind == _OCR_MSG_PROGRESS:
+                if progress_callback:
+                    progress_callback(msg[1], msg[2])
+            elif kind == _OCR_MSG_LOG:
+                log(msg[1])
+            elif kind == _OCR_MSG_RESULT:
+                result = (msg[1], msg[2])
 
-            logger.info(f"扫描版PDF，使用PP-Structure转换: 共{total_pages}页，转换第{start + 1}-{actual_end}页")
-
-            # 分卷转换：每 _OCR_DOCX_CHUNK_PAGES 页独立构建一个 docx 卷并立即
-            # 落盘、释放该卷内存。避免把整本（如906页/200万字）一次性塞进
-            # python-docx —— lxml 文档树加保存序列化会把内存放大数倍而撑爆。
-            chunk_starts = list(range(start, actual_end, _OCR_DOCX_CHUNK_PAGES))
-            multi_volume = len(chunk_starts) > 1
-            out_stem = os.path.splitext(output_path)[0]
-            if multi_volume:
-                log(f"文档较大（{pages_to_convert}页），按每{_OCR_DOCX_CHUNK_PAGES}页分卷输出，共{len(chunk_starts)}卷")
-
-            output_files = []
-            for vol_idx, chunk_start in enumerate(chunk_starts, start=1):
-                if self._is_cancelled:
+        # 轮询排水：转发进度/日志，直到子进程退出且消息排空
+        while True:
+            try:
+                handle(msg_queue.get(timeout=0.3))
+            except queue.Empty:
+                if not proc.is_alive():
                     break
-                chunk_end = min(chunk_start + _OCR_DOCX_CHUNK_PAGES, actual_end)
+                continue
+        # 子进程退出后再排空残留消息（result 可能晚于进程状态可见）
+        while True:
+            try:
+                handle(msg_queue.get_nowait())
+            except queue.Empty:
+                break
 
-                # 每卷独立 ASCII 临时目录：save_structure_res 的 img_idx 卷内从0起，
-                # 独立目录避免跨卷图名冲突，卷末即清理释放磁盘与内存
-                # （cv2.imwrite 在 Windows 无法写含中文路径，故必须用 ASCII 临时目录）
-                temp_dir = tempfile.mkdtemp(prefix='pdf_ppstructure_')
-                chunk_res = []
-                last_img = None
-                try:
-                    for page_idx in range(chunk_start, chunk_end):
-                        if self._is_cancelled:
-                            break
+        proc.join()
+        self._process = None
 
-                        current_page = page_idx - start + 1
-                        if progress_callback:
-                            progress_callback(current_page, pages_to_convert)
-
-                        logger.info(f"PP-Structure识别第 {page_idx + 1}/{total_pages} 页...")
-
-                        # 渲染页面为 BGR ndarray
-                        pix = doc[page_idx].get_pixmap(matrix=fitz.Matrix(zoom, zoom))
-                        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-                            pix.height, pix.width, pix.n
-                        )
-                        if pix.n == 4:
-                            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-                        else:
-                            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-
-                        # 版面分析 + OCR；rel_idx 卷内从0，用于图名与 docx 分页
-                        rel_idx = page_idx - chunk_start
-                        result = engine(img, img_idx=rel_idx)
-                        # 图片区域裁剪落盘，convert_info_docx 生成 docx 时需要读取
-                        save_structure_res(result, temp_dir, doc_name, img_idx=rel_idx)
-                        res = sorted_layout_boxes(result, img.shape[1])
-                        chunk_res += res
-                        last_img = img
-
-                    if self._is_cancelled:
-                        break
-
-                    if not chunk_res:
-                        logger.info(f"第{vol_idx}卷（第{chunk_start + 1}-{chunk_end}页）无识别内容，跳过")
-                        continue
-
-                    # 仅构建本卷 docx（内存峰值≈单卷），随即落盘
-                    convert_info_docx(last_img, chunk_res, temp_dir, doc_name)
-                    temp_docx = os.path.join(temp_dir, f'{doc_name}_ocr.docx')
-                    if not os.path.exists(temp_docx):
-                        return False, f"第{vol_idx}卷转换完成但输出文件不存在"
-
-                    # 第一卷沿用原始输出名（保证 output_word 指向有效文件），
-                    # 第2卷起追加 _partNN 后缀，与第一卷同目录
-                    if multi_volume and vol_idx > 1:
-                        vol_path = f"{out_stem}_part{vol_idx:02d}.docx"
-                    else:
-                        vol_path = output_path
-                    shutil.move(temp_docx, vol_path)
-                    output_files.append(vol_path)
-                    logger.info(
-                        f"第{vol_idx}/{len(chunk_starts)}卷完成"
-                        f"（第{chunk_start + 1}-{chunk_end}页）: {vol_path} "
-                        f"[{os.path.getsize(vol_path) / 1024:.1f}KB]"
-                    )
-                finally:
-                    # 释放本卷内存与临时目录，再处理下一卷
-                    chunk_res = None
-                    last_img = None
-                    if temp_dir:
-                        shutil.rmtree(temp_dir, ignore_errors=True)
-                        temp_dir = None
-                    gc.collect()
-
-            if self._is_cancelled:
-                return False, "转换被用户中断"
-
-            if not output_files:
-                return False, "PP-Structure未识别出任何内容"
-
-            if multi_volume:
-                logger.info(f"PP-Structure转换完成，共生成{len(output_files)}卷")
-                return True, (
-                    f"成功转换（文档较大，共{len(chunk_starts)}卷）：主文件 {output_files[0]}，"
-                    f"其余分卷（_partNN）在同一目录"
-                )
-
-            file_size_kb = os.path.getsize(output_files[0]) / 1024
-            logger.info(f"PP-Structure转换完成，文件大小: {file_size_kb:.1f}KB")
-            return True, f"成功转换到: {output_files[0]}"
-
-        except MemoryError:
-            return False, "内存不足，OCR转换需要较多内存，请尝试转换较少页数"
-
-        except Exception as e:
-            error_msg = f"OCR转换失败: {str(e)}"
-            logger.error(f"错误详情:\n{traceback.format_exc()}")
-            return False, error_msg
-
-        finally:
-            # 统一释放资源：取消/异常/正常路径都会执行
-            if doc is not None:
-                try:
-                    doc.close()
-                except Exception:
-                    pass
-            self._release_ocr_engine()
-            if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+        if self._is_cancelled:
+            return False, "转换被用户中断"
+        # 子进程异常退出（exitcode 非0/负值表示原生崩溃或被信号终止）
+        if proc.exitcode != 0:
+            logger.error(f"OCR子进程异常退出: exitcode={proc.exitcode}")
+            return False, _OCR_CRASH
+        if result is None:
+            logger.error("OCR子进程正常退出但未返回结果")
+            return False, _OCR_CRASH
+        return result
 
     # ========== 主转换入口 ==========
 
